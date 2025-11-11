@@ -1,9 +1,19 @@
 import React, { useEffect, useRef, useState } from "react";
 import { BrowserQRCodeReader } from "@zxing/browser";
 
+const BOX_FRACTION = 0.5;       // fraction of min(videoWidth, videoHeight) for the square aim box
+const CENTER_FRACTION = 0.4;    // center patch from QR crop
+
+// Auto-crop / stability controls
+const STABILITY_FRAMES = 4;     // how many recent frames must agree
+const POSITION_TOL_PX = 8;      // allowed movement of QR center
+const SIZE_TOL_RATIO = 0.18;    // allowed size change
+const PADDING_RATIO = 0.05;     // small padding around QR; set 0 for zero extra
+
 function App() {
   const videoRef = useRef(null);
   const videoTrackRef = useRef(null);
+  const qrBoxHistoryRef = useRef([]); // recent QR boxes for stability
 
   const [result, setResult] = useState("");
 
@@ -20,16 +30,6 @@ function App() {
   const [sharpAmount, setSharpAmount] = useState(0.3); // 0–1
   const [contrast, setContrast] = useState(1.0);       // 0.5–2
   const [brightness, setBrightness] = useState(0.0);   // -0.3–0.3
-
-  const CENTER_FRACTION = 0.4;
-
-  // Stability controls: slow down auto-cropping until QR is steady
-  const STABILITY_FRAMES = 4;         // how many consistent frames before we crop
-  const POSITION_TOL_PX = 8;          // allowed movement in px
-  const SIZE_TOL_RATIO = 0.18;        // allowed size change fraction
-  const PADDING_RATIO = 0.05;         // small padding around QR (set 0 for zero extra)
-
-  const qrBoxHistoryRef = useRef([]); // store recent {x, y, w, h}
 
   useEffect(() => {
     const codeReader = new BrowserQRCodeReader();
@@ -66,7 +66,6 @@ function App() {
         videoRef.current.setAttribute("playsinline", true);
         await videoRef.current.play();
 
-        // Decode with stability-based cropping
         controls = await codeReader.decodeFromVideoDevice(
           undefined,
           videoRef.current,
@@ -78,16 +77,20 @@ function App() {
             const vh = v.videoHeight;
             if (!vw || !vh) return;
 
-            // --- get QR bounding box from resultPoints ---
+            // --- Compute square bounding box in video coords ---
+            const boxSize = Math.floor(Math.min(vw, vh) * BOX_FRACTION);
+            const boxX = Math.floor((vw - boxSize) / 2);
+            const boxY = Math.floor((vh - boxSize) / 2);
+            const boxX2 = boxX + boxSize;
+            const boxY2 = boxY + boxSize;
+
+            // --- QR bounding box from resultPoints ---
             const pts =
               (res.getResultPoints && res.getResultPoints()) ||
               res.resultPoints ||
               [];
 
-            if (!pts || pts.length < 3) {
-              // Not enough info to get a tight box; ignore this frame.
-              return;
-            }
+            if (!pts || pts.length < 3) return;
 
             const xs = pts.map((p) => (p.getX ? p.getX() : p.x));
             const ys = pts.map((p) => (p.getY ? p.getY() : p.y));
@@ -96,25 +99,34 @@ function App() {
             let minY = Math.min(...ys);
             let maxY = Math.max(...ys);
 
-            let boxW = maxX - minX;
-            let boxH = maxY - minY;
+            let qrW = maxX - minX;
+            let qrH = maxY - minY;
 
-            // Tiny padding (optional; set PADDING_RATIO = 0 for zero)
-            const pad = PADDING_RATIO * Math.max(boxW, boxH);
-            minX = Math.max(0, Math.floor(minX - pad));
-            minY = Math.max(0, Math.floor(minY - pad));
-            boxW = Math.min(vw - minX, Math.floor(boxW + pad * 2));
-            boxH = Math.min(vh - minY, Math.floor(boxH + pad * 2));
-
-            // Save to history for stability check
-            pushQrBox({ x: minX, y: minY, w: boxW, h: boxH });
-
-            if (!isStable()) {
-              // QR still moving/unstable; don't crop yet.
+            // Require QR to be fully inside the visible square bounding box
+            if (
+              minX < boxX ||
+              minY < boxY ||
+              maxX > boxX2 ||
+              maxY > boxY2
+            ) {
+              // Ignore detections outside / crossing the box
+              qrBoxHistoryRef.current = [];
               return;
             }
 
-            // Now stable → lock and crop tightly to QR region
+            // Apply small padding only around QR (still within video bounds)
+            const pad = PADDING_RATIO * Math.max(qrW, qrH);
+            let cropX = Math.max(0, Math.floor(minX - pad));
+            let cropY = Math.max(0, Math.floor(minY - pad));
+            let cropW = Math.min(vw - cropX, Math.floor(qrW + pad * 2));
+            let cropH = Math.min(vh - cropY, Math.floor(qrH + pad * 2));
+
+            const qrBox = { x: cropX, y: cropY, w: cropW, h: cropH };
+            pushQrBox(qrBox);
+
+            // Only proceed once box has been stable over several frames
+            if (!isStable()) return;
+
             locked = true;
 
             const text = res.getText ? res.getText() : res.text;
@@ -125,13 +137,14 @@ function App() {
               captureQrRegion(v, stableBox);
             }
 
-            // Stop scanning & camera
+            // Stop scanning & camera after capture
             if (controls) controls.stop();
             if (currentStream) {
               currentStream.getTracks().forEach((t) => t.stop());
             }
             videoTrackRef.current = null;
             setTorchOn(false);
+            qrBoxHistoryRef.current = [];
           }
         );
       } catch (e) {
@@ -150,7 +163,6 @@ function App() {
       setTorchOn(false);
       qrBoxHistoryRef.current = [];
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Torch toggle
@@ -168,7 +180,7 @@ function App() {
     }
   };
 
-  // --- QR box stability helpers ---
+  // --- Stability helpers (for slow/robust auto-crop) ---
 
   function pushQrBox(box) {
     const hist = qrBoxHistoryRef.current;
@@ -176,35 +188,13 @@ function App() {
     if (hist.length > STABILITY_FRAMES) hist.shift();
   }
 
-  function isStable() {
-    const hist = qrBoxHistoryRef.current;
-    if (hist.length < STABILITY_FRAMES) return false;
-
-    const avg = getAverageBox();
-    if (!avg) return false;
-
-    for (const b of hist) {
-      const centerDx = Math.abs((b.x + b.w / 2) - (avg.x + avg.w / 2));
-      const centerDy = Math.abs((b.y + b.h / 2) - (avg.y + avg.h / 2));
-      const sizeDrW = Math.abs(b.w - avg.w) / avg.w;
-      const sizeDrH = Math.abs(b.h - avg.h) / avg.h;
-
-      if (
-        centerDx > POSITION_TOL_PX ||
-        centerDy > POSITION_TOL_PX ||
-        sizeDrW > SIZE_TOL_RATIO ||
-        sizeDrH > SIZE_TOL_RATIO
-      ) {
-        return false;
-      }
-    }
-    return true;
-  }
-
   function getAverageBox() {
     const hist = qrBoxHistoryRef.current;
     if (!hist.length) return null;
-    let sx = 0, sy = 0, sw = 0, sh = 0;
+    let sx = 0,
+      sy = 0,
+      sw = 0,
+      sh = 0;
     for (const b of hist) {
       sx += b.x;
       sy += b.y;
@@ -220,7 +210,38 @@ function App() {
     };
   }
 
-  // --- Capture & center extraction: only QR region ---
+  function isStable() {
+    const hist = qrBoxHistoryRef.current;
+    if (hist.length < STABILITY_FRAMES) return false;
+
+    const avg = getAverageBox();
+    if (!avg) return false;
+
+    for (const b of hist) {
+      const cx = b.x + b.w / 2;
+      const cy = b.y + b.h / 2;
+      const cax = avg.x + avg.w / 2;
+      const cay = avg.y + avg.h / 2;
+
+      const centerDx = Math.abs(cx - cax);
+      const centerDy = Math.abs(cy - cay);
+      const sizeDrW = Math.abs(b.w - avg.w) / avg.w;
+      const sizeDrH = Math.abs(b.h - avg.h) / avg.h;
+
+      if (
+        centerDx > POSITION_TOL_PX ||
+        centerDy > POSITION_TOL_PX ||
+        sizeDrW > SIZE_TOL_RATIO ||
+        sizeDrH > SIZE_TOL_RATIO
+      ) {
+        return false;
+      }
+    }
+
+    return true;
+  }
+
+  // --- Capture: tight QR-only crop based on stable box ---
 
   function captureQrRegion(video, box) {
     const { x, y, w, h } = box;
@@ -234,7 +255,7 @@ function App() {
     const qrUrl = qrCanvas.toDataURL("image/png");
     setQrBase(qrUrl);
 
-    // center 40% from within QR-only crop
+    // Center 40% from within qr-only crop
     const baseSize = Math.min(w, h);
     const patchSize = Math.floor(baseSize * CENTER_FRACTION);
     const cx = Math.floor(w / 2);
@@ -359,7 +380,7 @@ function App() {
 
   return (
     <div style={{ textAlign: "center", padding: "20px" }}>
-      <h2>QR → CDP Extractor (Tight QR-Only Crop + Stable Lock)</h2>
+      <h2>QR → CDP Extractor (Box-Aimed, QR-Only Stable Crop)</h2>
 
       <div style={{ position: "relative", display: "inline-block" }}>
         <video
@@ -371,7 +392,21 @@ function App() {
             borderRadius: "8px",
           }}
         />
-        {/* We can optionally visualize last stable box later if you want */}
+        {/* Square bounding box overlay (aim region) */}
+        <div
+          style={{
+            position: "absolute",
+            top: "50%",
+            left: "50%",
+            transform: "translate(-50%, -50%)",
+            aspectRatio: "1 / 1",
+            width: `${BOX_FRACTION * 100}%`,
+            border: "2px solid #00ff99",
+            borderRadius: "8px",
+            boxSizing: "border-box",
+            pointerEvents: "none",
+          }}
+        />
         {torchSupported && (
           <button
             onClick={handleToggleTorch}
