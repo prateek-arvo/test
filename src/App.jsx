@@ -3,14 +3,19 @@ import { BrowserQRCodeReader } from "@zxing/browser";
 
 function App() {
   const videoRef = useRef(null);
+  const videoTrackRef = useRef(null);
 
   const [result, setResult] = useState("");
-  const [qrCropped, setQrCropped] = useState(null);      // QR crop (after optional sharpen)
-  const [centerCrop, setCenterCrop] = useState(null);    // Center patch from QR (no extra sharpen)
+  const [qrCropped, setQrCropped] = useState(null);
+  const [qrCroppedSharp, setQrCroppedSharp] = useState(null);
+  const [centerCrop, setCenterCrop] = useState(null);
+  const [centerCropSharp, setCenterCropSharp] = useState(null);
 
-  // Toggle this to compare behavior
-  const USE_MILD_SHARPEN = true;
-  const CENTER_FRACTION = 0.5; // 50% center patch (safer than 36%)
+  const [torchSupported, setTorchSupported] = useState(false);
+  const [torchOn, setTorchOn] = useState(false);
+
+  const CENTER_FRACTION = 0.4; // 40% center crop
+  const USE_MILD_SHARPEN = true; // one mild sharpen pass
 
   useEffect(() => {
     const codeReader = new BrowserQRCodeReader();
@@ -29,6 +34,16 @@ function App() {
         });
 
         currentStream = stream;
+        const [track] = stream.getVideoTracks();
+        videoTrackRef.current = track;
+
+        // Detect torch support
+        try {
+          const caps = track.getCapabilities?.();
+          if (caps && "torch" in caps) setTorchSupported(true);
+        } catch {
+          setTorchSupported(false);
+        }
 
         if (!videoRef.current) return;
         videoRef.current.srcObject = stream;
@@ -67,14 +82,13 @@ function App() {
 
               const boxW = maxX - minX;
               const boxH = maxY - minY;
-              const pad = 0.15 * Math.max(boxW, boxH); // 15% padding
+              const pad = 0.15 * Math.max(boxW, boxH);
 
               x = Math.max(0, Math.floor(minX - pad));
               y = Math.max(0, Math.floor(minY - pad));
               w = Math.min(vw - x, Math.floor(boxW + pad * 2));
               h = Math.min(vh - y, Math.floor(boxH + pad * 2));
             } else {
-              // Fallback: center box, still integer + safe
               const size = Math.floor(Math.min(vw, vh) * 0.5);
               x = Math.floor((vw - size) / 2);
               y = Math.floor((vh - size) / 2);
@@ -85,19 +99,22 @@ function App() {
             const qrCtx = qrCanvas.getContext("2d");
             qrCanvas.width = w;
             qrCanvas.height = h;
-
             qrCtx.drawImage(v, x, y, w, h, 0, 0, w, h);
 
-            // ---------- Step 2: [optional] mild sharpen on full QR once ----------
+            const qrCropUrl = qrCanvas.toDataURL("image/png");
+            setQrCropped(qrCropUrl);
+
+            // ---------- Step 2: one mild sharpen (keeps brightness) ----------
             if (USE_MILD_SHARPEN) {
-              const qrImageData = qrCtx.getImageData(0, 0, w, h);
-              const qrSharpData = applyMildSharpen(qrImageData);
-              qrCtx.putImageData(qrSharpData, 0, 0);
+              const imgData = qrCtx.getImageData(0, 0, w, h);
+              const sharpData = applyMildSharpen(imgData);
+              qrCtx.putImageData(sharpData, 0, 0);
             }
 
-            setQrCropped(qrCanvas.toDataURL("image/png"));
+            const qrSharpUrl = qrCanvas.toDataURL("image/png");
+            setQrCroppedSharp(qrSharpUrl);
 
-            // ---------- Step 3: center patch from (possibly sharpened) QR ----------
+            // ---------- Step 3: center 40% (from sharpened QR) ----------
             const baseSize = Math.min(qrCanvas.width, qrCanvas.height);
             const patchSize = Math.floor(baseSize * CENTER_FRACTION);
 
@@ -131,14 +148,24 @@ function App() {
               patchSize
             );
 
-            // No extra sharpen here: keep CDP structure intact
-            setCenterCrop(centerCanvas.toDataURL("image/png"));
+            const centerUrl = centerCanvas.toDataURL("image/png");
+            setCenterCrop(centerUrl);
+
+            // ---------- Step 4: optional second mild sharpen ----------
+            const cData = centerCtx.getImageData(0, 0, patchSize, patchSize);
+            const cSharp = applyMildSharpen(cData);
+            centerCtx.putImageData(cSharp, 0, 0);
+
+            const centerSharpUrl = centerCanvas.toDataURL("image/png");
+            setCenterCropSharp(centerSharpUrl);
 
             // ---------- Cleanup ----------
             if (controls) controls.stop();
             if (currentStream) {
               currentStream.getTracks().forEach((t) => t.stop());
             }
+            videoTrackRef.current = null;
+            setTorchOn(false);
           }
         );
       } catch (e) {
@@ -153,22 +180,41 @@ function App() {
       if (currentStream) {
         currentStream.getTracks().forEach((t) => t.stop());
       }
+      videoTrackRef.current = null;
+      setTorchOn(false);
     };
   }, []);
 
-  // Mild sharpen (less aggressive than classic 0 -1 0 / -1 5 -1 / 0 -1 0)
-  // Center weight tuned to 4.2 instead of 5 to reduce haloing.
+  // 🔦 Torch control
+  const handleToggleTorch = async () => {
+    const track = videoTrackRef.current;
+    if (!track || !track.getCapabilities || !track.applyConstraints) return;
+
+    try {
+      const caps = track.getCapabilities();
+      if (!caps || !caps.torch) return;
+
+      const newValue = !torchOn;
+      await track.applyConstraints({
+        advanced: [{ torch: newValue }],
+      });
+      setTorchOn(newValue);
+    } catch (err) {
+      console.warn("Torch toggle failed or unsupported:", err);
+    }
+  };
+
+  // --- Mild sharpen that keeps brightness consistent ---
   function applyMildSharpen(imageData) {
     const { width, height, data } = imageData;
     const out = new Uint8ClampedArray(data.length);
     const stride = width * 4;
 
-    const k = [0, -1, 0, -1, 4.2, -1, 0, -1, 0];
+    const k = [0, -1, 0, -1, 4.1, -1, 0, -1, 0]; // mild kernel
 
     for (let y = 1; y < height - 1; y++) {
       for (let x = 1; x < width - 1; x++) {
         const idx = (y * width + x) * 4;
-
         for (let c = 0; c < 3; c++) {
           const tl = data[idx - stride - 4 + c];
           const t = data[idx - stride + c];
@@ -191,41 +237,50 @@ function App() {
             k[7] * b +
             k[8] * br;
 
-          if (val < 0) val = 0;
-          if (val > 255) val = 255;
+          val = Math.max(0, Math.min(255, val));
           out[idx + c] = val;
         }
-
-        out[idx + 3] = data[idx + 3]; // alpha
+        out[idx + 3] = data[idx + 3];
       }
     }
-
-    // Copy borders unchanged
-    for (let i = 0; i < data.length; i += 4) {
-      if (out[i + 3] === 0) {
-        out[i] = data[i];
-        out[i + 1] = data[i + 1];
-        out[i + 2] = data[i + 2];
-        out[i + 3] = data[i + 3];
-      }
-    }
-
     return new ImageData(out, width, height);
   }
 
   return (
     <div style={{ textAlign: "center", padding: "20px" }}>
-      <h2>QR CDP Extractor</h2>
+      <h2>QR → CDP Extractor (Clean + Bright)</h2>
 
-      <video
-        ref={videoRef}
-        style={{
-          width: "100%",
-          maxWidth: "500px",
-          border: "1px solid #ccc",
-          borderRadius: "8px",
-        }}
-      />
+      <div style={{ position: "relative", display: "inline-block" }}>
+        <video
+          ref={videoRef}
+          style={{
+            width: "100%",
+            maxWidth: "500px",
+            border: "1px solid #ccc",
+            borderRadius: "8px",
+          }}
+        />
+        {torchSupported && (
+          <button
+            onClick={handleToggleTorch}
+            style={{
+              position: "absolute",
+              bottom: 10,
+              right: 10,
+              padding: "6px 10px",
+              fontSize: "12px",
+              borderRadius: "6px",
+              border: "none",
+              background: torchOn ? "#ffcc00" : "#333",
+              color: torchOn ? "#000" : "#fff",
+              cursor: "pointer",
+              opacity: 0.9,
+            }}
+          >
+            {torchOn ? "Flash ON" : "Flash OFF"}
+          </button>
+        )}
+      </div>
 
       {result && (
         <div style={{ marginTop: "16px" }}>
@@ -245,7 +300,10 @@ function App() {
         </div>
       )}
 
-      {(qrCropped || centerCrop) && (
+      {(qrCropped ||
+        qrCroppedSharp ||
+        centerCrop ||
+        centerCropSharp) && (
         <div
           style={{
             display: "flex",
@@ -257,12 +315,27 @@ function App() {
         >
           {qrCropped && (
             <div>
-              <h4>QR crop {USE_MILD_SHARPEN ? "(mild sharpen)" : ""}</h4>
+              <h4>QR crop (raw)</h4>
               <img
                 src={qrCropped}
                 alt="QR cropped"
                 style={{
-                  maxWidth: "200px",
+                  maxWidth: "180px",
+                  borderRadius: "8px",
+                  border: "1px solid #ddd",
+                }}
+              />
+            </div>
+          )}
+
+          {qrCroppedSharp && (
+            <div>
+              <h4>QR crop (mild sharpen)</h4>
+              <img
+                src={qrCroppedSharp}
+                alt="QR cropped sharpened"
+                style={{
+                  maxWidth: "180px",
                   borderRadius: "8px",
                   border: "1px solid #ddd",
                 }}
@@ -272,25 +345,31 @@ function App() {
 
           {centerCrop && (
             <div>
-              <h4>Center {CENTER_FRACTION * 100}% (no extra sharpen)</h4>
+              <h4>Center 40% (from sharpened QR)</h4>
               <img
                 src={centerCrop}
-                alt="Center patch"
+                alt="Center 40%"
                 style={{
-                  maxWidth: "200px",
+                  maxWidth: "180px",
                   borderRadius: "8px",
                   border: "1px solid #ddd",
                 }}
               />
-              <p
+            </div>
+          )}
+
+          {centerCropSharp && (
+            <div>
+              <h4>Center 40% (mild sharpen)</h4>
+              <img
+                src={centerCropSharp}
+                alt="Center 40% sharpened"
                 style={{
-                  fontSize: "11px",
-                  color: "#666",
-                  marginTop: "4px",
+                  maxWidth: "180px",
+                  borderRadius: "8px",
+                  border: "1px solid #ddd",
                 }}
-              >
-                Use this patch as Siamese CNN input.
-              </p>
+              />
             </div>
           )}
         </div>
