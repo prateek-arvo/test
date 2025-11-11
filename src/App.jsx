@@ -4,8 +4,8 @@ import { BrowserQRCodeReader } from "@zxing/browser";
 function App() {
   const videoRef = useRef(null);
   const [result, setResult] = useState("");
-  const [snapshotFull, setSnapshotFull] = useState(null);
-  const [snapshotCropped, setSnapshotCropped] = useState(null);
+  const [qrCropped, setQrCropped] = useState(null);       // step 2 output: QR-only sharpened
+  const [qrCropped36, setQrCropped36] = useState(null);   // step 3 output: 36% center crop of above
 
   useEffect(() => {
     const codeReader = new BrowserQRCodeReader();
@@ -24,8 +24,8 @@ function App() {
         });
 
         currentStream = stream;
-        if (!videoRef.current) return;
 
+        if (!videoRef.current) return;
         videoRef.current.srcObject = stream;
         videoRef.current.setAttribute("playsinline", true);
         await videoRef.current.play();
@@ -44,73 +44,112 @@ function App() {
             const vw = v.videoWidth;
             const vh = v.videoHeight;
 
-            // Capture full frame
-            const fullCanvas = document.createElement("canvas");
-            const fullCtx = fullCanvas.getContext("2d");
-            fullCanvas.width = vw;
-            fullCanvas.height = vh;
-            fullCtx.drawImage(v, 0, 0, vw, vh);
-            const fullDataUrl = fullCanvas.toDataURL("image/png");
-            setSnapshotFull(fullDataUrl);
+            // --- Step 1: crop to the QR only (using bounding box of resultPoints) ---
 
-            // Determine QR center for crop
             const pts =
               (res.getResultPoints && res.getResultPoints()) ||
               res.resultPoints ||
               [];
-            let cx = vw / 2;
-            let cy = vh / 2;
 
-            if (pts.length >= 1) {
-              const xs = pts.map((p) => (p.getX ? p.getX() : p.x));
-              const ys = pts.map((p) => (p.getY ? p.getY() : p.y));
-              cx = (Math.min(...xs) + Math.max(...xs)) / 2;
-              cy = (Math.min(...ys) + Math.max(...ys)) / 2;
+            if (!pts || pts.length < 3) {
+              console.warn("Not enough points to reliably crop QR.");
             }
 
-            // 36% square centered on QR
-            const cropSize = 0.36 * Math.min(vw, vh);
-            let x = cx - cropSize / 2;
-            let y = cy - cropSize / 2;
-            if (x < 0) x = 0;
-            if (y < 0) y = 0;
-            if (x + cropSize > vw) x = vw - cropSize;
-            if (y + cropSize > vh) y = vh - cropSize;
+            // If we have points, compute bounding box, else fallback to center-ish box
+            let x, y, w, h;
+            if (pts && pts.length >= 3) {
+              const xs = pts.map((p) => (p.getX ? p.getX() : p.x));
+              const ys = pts.map((p) => (p.getY ? p.getY() : p.y));
 
-            const cropCanvas = document.createElement("canvas");
-            const cropCtx = cropCanvas.getContext("2d");
-            cropCanvas.width = cropSize;
-            cropCanvas.height = cropSize;
+              const minX = Math.min(...xs);
+              const maxX = Math.max(...xs);
+              const minY = Math.min(...ys);
+              const maxY = Math.max(...ys);
 
-            cropCtx.drawImage(
-              v,
-              x,
-              y,
-              cropSize,
-              cropSize,
+              x = minX;
+              y = minY;
+              w = maxX - minX;
+              h = maxY - minY;
+
+              // add padding so we fully include QR modules
+              const pad = 0.15 * Math.max(w, h); // 15% padding
+              x = Math.max(0, x - pad);
+              y = Math.max(0, y - pad);
+              w = Math.min(vw - x, w + pad * 2);
+              h = Math.min(vh - y, h + pad * 2);
+            } else {
+              // fallback: center square
+              const size = Math.min(vw, vh) * 0.5;
+              x = (vw - size) / 2;
+              y = (vh - size) / 2;
+              w = h = size;
+            }
+
+            // Draw QR-only crop
+            const qrCanvas = document.createElement("canvas");
+            const qrCtx = qrCanvas.getContext("2d");
+            qrCanvas.width = w;
+            qrCanvas.height = h;
+
+            qrCtx.drawImage(v, x, y, w, h, 0, 0, w, h);
+
+            // --- Step 2: sharpen the QR-only crop ---
+
+            const qrImageData = qrCtx.getImageData(0, 0, qrCanvas.width, qrCanvas.height);
+            const sharpenedData = applySharpen(qrImageData);
+            qrCtx.putImageData(sharpenedData, 0, 0);
+
+            const qrSharpenedDataUrl = qrCanvas.toDataURL("image/png");
+            setQrCropped(qrSharpenedDataUrl);
+
+            // --- Step 3: 36% center crop from the sharpened QR crop ---
+
+            const baseSize = Math.min(qrCanvas.width, qrCanvas.height);
+            const cropSize36 = 0.36 * baseSize;
+
+            const cx = qrCanvas.width / 2;
+            const cy = qrCanvas.height / 2;
+
+            let x36 = cx - cropSize36 / 2;
+            let y36 = cy - cropSize36 / 2;
+
+            if (x36 < 0) x36 = 0;
+            if (y36 < 0) y36 = 0;
+            if (x36 + cropSize36 > qrCanvas.width)
+              x36 = qrCanvas.width - cropSize36;
+            if (y36 + cropSize36 > qrCanvas.height)
+              y36 = qrCanvas.height - cropSize36;
+
+            const innerCanvas = document.createElement("canvas");
+            const innerCtx = innerCanvas.getContext("2d");
+            innerCanvas.width = cropSize36;
+            innerCanvas.height = cropSize36;
+
+            innerCtx.drawImage(
+              qrCanvas,
+              x36,
+              y36,
+              cropSize36,
+              cropSize36,
               0,
               0,
-              cropSize,
-              cropSize
+              cropSize36,
+              cropSize36
             );
 
-            // Apply sharpen
-            const imgData = cropCtx.getImageData(0, 0, cropSize, cropSize);
-            const sharpened = applySharpen(imgData);
-            cropCtx.putImageData(sharpened, 0, 0);
-            const cropDataUrl = cropCanvas.toDataURL("image/png");
+            const qr36DataUrl = innerCanvas.toDataURL("image/png");
+            setQrCropped36(qr36DataUrl);
 
-            setSnapshotCropped(cropDataUrl);
+            // --- Cleanup: stop scanning & camera ---
 
-            // Stop camera
             if (controls) controls.stop();
             if (currentStream) {
               currentStream.getTracks().forEach((t) => t.stop());
             }
           }
         );
-      } catch (err) {
-        console.error("Camera or decoding error:", err);
+      } catch (e) {
+        console.error("Camera or decoding error:", e);
       }
     };
 
@@ -118,35 +157,62 @@ function App() {
 
     return () => {
       if (controls) controls.stop();
-      if (currentStream) currentStream.getTracks().forEach((t) => t.stop());
+      if (currentStream) {
+        currentStream.getTracks().forEach((t) => t.stop());
+      }
     };
   }, []);
 
-  // Simple 3x3 sharpen filter
+  // Simple sharpen with 3x3 kernel [0 -1 0; -1 5 -1; 0 -1 0]
   function applySharpen(imageData) {
     const { width, height, data } = imageData;
     const out = new Uint8ClampedArray(data.length);
-    const w = width * 4;
-    const kernel = [0, -1, 0, -1, 5, -1, 0, -1, 0];
+    const stride = width * 4;
+    const k = [0, -1, 0, -1, 5, -1, 0, -1, 0];
 
     for (let y = 1; y < height - 1; y++) {
       for (let x = 1; x < width - 1; x++) {
-        for (let c = 0; c < 3; c++) {
-          let i = (y * width + x) * 4 + c;
-          let sum =
-            data[i - w - 4] * kernel[0] +
-            data[i - w] * kernel[1] +
-            data[i - w + 4] * kernel[2] +
-            data[i - 4] * kernel[3] +
-            data[i] * kernel[4] +
-            data[i + 4] * kernel[5] +
-            data[i + w - 4] * kernel[6] +
-            data[i + w] * kernel[7] +
-            data[i + w + 4] * kernel[8];
+        const idx = (y * width + x) * 4;
 
-          out[i] = Math.min(255, Math.max(0, sum));
+        for (let c = 0; c < 3; c++) {
+          let sum =
+            data[idx - stride - 4 + c] * k[0] + // tl
+            data[idx - stride + c] * k[1] + // t
+            data[idx - stride + 4 + c] * k[2] + // tr
+            data[idx - 4 + c] * k[3] + // l
+            data[idx + c] * k[4] + // center
+            data[idx + 4 + c] * k[5] + // r
+            data[idx + stride - 4 + c] * k[6] + // bl
+            data[idx + stride + c] * k[7] + // b
+            data[idx + stride + 4 + c] * k[8]; // br
+
+          if (sum < 0) sum = 0;
+          if (sum > 255) sum = 255;
+          out[idx + c] = sum;
         }
-        out[(y * width + x) * 4 + 3] = data[(y * width + x) * 4 + 3];
+
+        // alpha
+        out[idx + 3] = data[idx + 3];
+      }
+    }
+
+    // Copy border pixels unchanged
+    for (let x = 0; x < width; x++) {
+      for (const y of [0, height - 1]) {
+        const idx = (y * width + x) * 4;
+        out[idx] = data[idx];
+        out[idx + 1] = data[idx + 1];
+        out[idx + 2] = data[idx + 2];
+        out[idx + 3] = data[idx + 3];
+      }
+    }
+    for (let y = 0; y < height; y++) {
+      for (const x of [0, width - 1]) {
+        const idx = (y * width + x) * 4;
+        out[idx] = data[idx];
+        out[idx + 1] = data[idx + 1];
+        out[idx + 2] = data[idx + 2];
+        out[idx + 3] = data[idx + 3];
       }
     }
 
@@ -185,7 +251,7 @@ function App() {
         </div>
       )}
 
-      {(snapshotFull || snapshotCropped) && (
+      {(qrCropped || qrCropped36) && (
         <div
           style={{
             display: "flex",
@@ -195,12 +261,12 @@ function App() {
             marginTop: "20px",
           }}
         >
-          {snapshotFull && (
+          {qrCropped && (
             <div>
-              <h4>Original Frame</h4>
+              <h4>QR-only (sharpened)</h4>
               <img
-                src={snapshotFull}
-                alt="Full Frame"
+                src={qrCropped}
+                alt="QR cropped sharpened"
                 style={{
                   maxWidth: "260px",
                   borderRadius: "8px",
@@ -210,12 +276,12 @@ function App() {
             </div>
           )}
 
-          {snapshotCropped && (
+          {qrCropped36 && (
             <div>
-              <h4>Cropped & Sharpened (36%)</h4>
+              <h4>Center 36% of QR</h4>
               <img
-                src={snapshotCropped}
-                alt="Cropped QR"
+                src={qrCropped36}
+                alt="Center 36% of QR"
                 style={{
                   maxWidth: "260px",
                   borderRadius: "8px",
