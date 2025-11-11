@@ -1,9 +1,14 @@
 import React, { useEffect, useRef, useState } from "react";
 import { BrowserQRCodeReader } from "@zxing/browser";
 
+const BOX_FRACTION = 0.5;        // fixed capture box size (50% of video)
+const CENTER_FRACTION = 0.4;     // center patch from captured box
+const MAX_BUFFER = 12;           // how many frames to keep in history
+
 function App() {
   const videoRef = useRef(null);
   const videoTrackRef = useRef(null);
+  const frameBufferRef = useRef([]); // [{ url, sharpness }]
 
   const [result, setResult] = useState("");
 
@@ -17,17 +22,18 @@ function App() {
   const [torchOn, setTorchOn] = useState(false);
 
   // Post-capture tuning
-  const [sharpAmount, setSharpAmount] = useState(0.3);    // 0–1
-  const [contrast, setContrast] = useState(1.0);          // 0.5–2
-  const [brightness, setBrightness] = useState(0.0);      // -0.3–0.3
-
-  const CENTER_FRACTION = 0.4;
+  const [sharpAmount, setSharpAmount] = useState(0.3); // 0–1
+  const [contrast, setContrast] = useState(1.0);       // 0.5–2
+  const [brightness, setBrightness] = useState(0.0);   // -0.3–0.3
 
   useEffect(() => {
     const codeReader = new BrowserQRCodeReader();
     let currentStream = null;
     let controls = null;
     let locked = false;
+    let rafId = null;
+
+    frameBufferRef.current = [];
 
     const startCameraAndScan = async () => {
       try {
@@ -56,94 +62,98 @@ function App() {
         videoRef.current.setAttribute("playsinline", true);
         await videoRef.current.play();
 
+        // Start frame buffering loop (captures only the bounding box region)
+        const startFrameBufferLoop = () => {
+          const loop = () => {
+            // If we've already locked on a QR, just keep looping until cancelled
+            if (!videoRef.current || !videoRef.current.videoWidth || !videoRef.current.videoHeight) {
+              rafId = requestAnimationFrame(loop);
+              return;
+            }
+
+            if (!locked) {
+              const v = videoRef.current;
+              const vw = v.videoWidth;
+              const vh = v.videoHeight;
+
+              const boxW = Math.floor(vw * BOX_FRACTION);
+              const boxH = Math.floor(vh * BOX_FRACTION);
+              const x = Math.floor((vw - boxW) / 2);
+              const y = Math.floor((vh - boxH) / 2);
+
+              const canvas = document.createElement("canvas");
+              canvas.width = boxW;
+              canvas.height = boxH;
+              const ctx = canvas.getContext("2d");
+              ctx.drawImage(v, x, y, boxW, boxH, 0, 0, boxW, boxH);
+
+              const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+              const sharpness = computeSharpness(imgData);
+              const url = canvas.toDataURL("image/png");
+
+              const buf = frameBufferRef.current;
+              buf.push({ url, sharpness });
+              if (buf.length > MAX_BUFFER) buf.shift();
+            }
+
+            rafId = requestAnimationFrame(loop);
+          };
+
+          rafId = requestAnimationFrame(loop);
+        };
+
+        startFrameBufferLoop();
+
+        // Start QR decode; on success, pick best frame from buffer
         controls = await codeReader.decodeFromVideoDevice(
           undefined,
           videoRef.current,
           (res, err) => {
-            if (locked || !res) return;
+            if (!res || locked) return;
+
             locked = true;
 
             const text = res.getText ? res.getText() : res.text;
-            setResult(text);
+            setResult(text || "");
 
-            const v = videoRef.current;
-            const vw = v.videoWidth;
-            const vh = v.videoHeight;
-
-            // --- QR crop (bbox + padding) ---
-            const pts =
-              (res.getResultPoints && res.getResultPoints()) ||
-              res.resultPoints ||
-              [];
-
-            let x, y, w, h;
-            if (pts && pts.length >= 3) {
-              const xs = pts.map((p) => (p.getX ? p.getX() : p.x));
-              const ys = pts.map((p) => (p.getY ? p.getY() : p.y));
-              const minX = Math.min(...xs);
-              const maxX = Math.max(...xs);
-              const minY = Math.min(...ys);
-              const maxY = Math.max(...ys);
-              const boxW = maxX - minX;
-              const boxH = maxY - minY;
-              const pad = 0.15 * Math.max(boxW, boxH);
-
-              x = Math.max(0, Math.floor(minX - pad));
-              y = Math.max(0, Math.floor(minY - pad));
-              w = Math.min(vw - x, Math.floor(boxW + pad * 2));
-              h = Math.min(vh - y, Math.floor(boxH + pad * 2));
+            // Choose sharpest frame from buffer, or fallback capture
+            const buf = frameBufferRef.current;
+            if (buf && buf.length > 0) {
+              const best = buf.reduce((a, b) =>
+                b.sharpness > a.sharpness ? b : a
+              );
+              handleCapturedBox(best.url);
             } else {
-              const size = Math.floor(Math.min(vw, vh) * 0.5);
-              x = Math.floor((vw - size) / 2);
-              y = Math.floor((vh - size) / 2);
-              w = h = size;
+              // Fallback: capture once from the bounding box now
+              if (videoRef.current) {
+                const v = videoRef.current;
+                const vw = v.videoWidth;
+                const vh = v.videoHeight;
+                const boxW = Math.floor(vw * BOX_FRACTION);
+                const boxH = Math.floor(vh * BOX_FRACTION);
+                const x = Math.floor((vw - boxW) / 2);
+                const y = Math.floor((vh - boxH) / 2);
+
+                const canvas = document.createElement("canvas");
+                canvas.width = boxW;
+                canvas.height = boxH;
+                const ctx = canvas.getContext("2d");
+                ctx.drawImage(v, x, y, boxW, boxH, 0, 0, boxW, boxH);
+                const url = canvas.toDataURL("image/png");
+                handleCapturedBox(url);
+              }
             }
 
-            const qrCanvas = document.createElement("canvas");
-            qrCanvas.width = w;
-            qrCanvas.height = h;
-            const qrCtx = qrCanvas.getContext("2d");
-            qrCtx.drawImage(v, x, y, w, h, 0, 0, w, h);
-            const qrUrl = qrCanvas.toDataURL("image/png");
-            setQrBase(qrUrl);
-
-            // --- Center 40% from QR ---
-            const baseSize = Math.min(w, h);
-            const patchSize = Math.floor(baseSize * CENTER_FRACTION);
-            const cx = Math.floor(w / 2);
-            const cy = Math.floor(h / 2);
-            let px = cx - Math.floor(patchSize / 2);
-            let py = cy - Math.floor(patchSize / 2);
-            if (px < 0) px = 0;
-            if (py < 0) py = 0;
-            if (px + patchSize > w) px = w - patchSize;
-            if (py + patchSize > h) py = h - patchSize;
-
-            const centerCanvas = document.createElement("canvas");
-            centerCanvas.width = patchSize;
-            centerCanvas.height = patchSize;
-            const centerCtx = centerCanvas.getContext("2d");
-            centerCtx.drawImage(
-              qrCanvas,
-              px,
-              py,
-              patchSize,
-              patchSize,
-              0,
-              0,
-              patchSize,
-              patchSize
-            );
-            const centerUrl = centerCanvas.toDataURL("image/png");
-            setCenterBase(centerUrl);
-
-            // Stop camera after capture
+            // Stop scanning & camera
             if (controls) controls.stop();
             if (currentStream) {
               currentStream.getTracks().forEach((t) => t.stop());
             }
             videoTrackRef.current = null;
             setTorchOn(false);
+            frameBufferRef.current = [];
+
+            if (rafId) cancelAnimationFrame(rafId);
           }
         );
       } catch (e) {
@@ -160,6 +170,8 @@ function App() {
       }
       videoTrackRef.current = null;
       setTorchOn(false);
+      frameBufferRef.current = [];
+      if (rafId) cancelAnimationFrame(rafId);
     };
   }, []);
 
@@ -178,6 +190,48 @@ function App() {
     }
   };
 
+  // Handle captured bounding box (set qrBase & centerBase)
+  function handleCapturedBox(boxUrl) {
+    if (!boxUrl) return;
+    setQrBase(boxUrl);
+
+    const img = new Image();
+    img.src = boxUrl;
+    img.onload = () => {
+      const { width, height } = img;
+      const baseSize = Math.min(width, height);
+      const patchSize = Math.floor(baseSize * CENTER_FRACTION);
+      const cx = Math.floor(width / 2);
+      const cy = Math.floor(height / 2);
+
+      let px = cx - Math.floor(patchSize / 2);
+      let py = cy - Math.floor(patchSize / 2);
+      if (px < 0) px = 0;
+      if (py < 0) py = 0;
+      if (px + patchSize > width) px = width - patchSize;
+      if (py + patchSize > height) py = height - patchSize;
+
+      const centerCanvas = document.createElement("canvas");
+      centerCanvas.width = patchSize;
+      centerCanvas.height = patchSize;
+      const centerCtx = centerCanvas.getContext("2d");
+      centerCtx.drawImage(
+        img,
+        px,
+        py,
+        patchSize,
+        patchSize,
+        0,
+        0,
+        patchSize,
+        patchSize
+      );
+
+      const centerUrl = centerCanvas.toDataURL("image/png");
+      setCenterBase(centerUrl);
+    };
+  }
+
   // Recompute processed previews whenever sliders or base images change
   useEffect(() => {
     if (!qrBase) return;
@@ -189,7 +243,8 @@ function App() {
     processImage(centerBase, sharpAmount, contrast, brightness, setCenterProcessed);
   }, [centerBase, sharpAmount, contrast, brightness]);
 
-  // Apply brightness + contrast + unsharp
+  // --- Image processing helpers ---
+
   function processImage(url, sharpAmt, contrastVal, brightnessVal, cb) {
     const img = new Image();
     img.src = url;
@@ -213,15 +268,11 @@ function App() {
   // Brightness [-0.5,0.5], Contrast [0.5,2]
   function applyBrightnessContrast(imageData, contrastVal, brightnessVal) {
     const { data } = imageData;
-    // contrast formula around mid-point:
     // new = ((old/255 - 0.5) * contrast + 0.5 + brightness) * 255
     for (let i = 0; i < data.length; i += 4) {
       for (let c = 0; c < 3; c++) {
         const old = data[i + c] / 255;
-        let val =
-          (old - 0.5) * contrastVal +
-          0.5 +
-          brightnessVal;
+        let val = (old - 0.5) * contrastVal + 0.5 + brightnessVal;
         if (val < 0) val = 0;
         if (val > 1) val = 1;
         data[i + c] = Math.round(val * 255);
@@ -274,11 +325,43 @@ function App() {
     return new ImageData(out, width, height);
   }
 
+  // Simple gradient-based sharpness metric
+  function computeSharpness(imageData) {
+    const { width, height, data } = imageData;
+    let sum = 0;
+    let count = 0;
+
+    for (let y = 1; y < height - 1; y++) {
+      for (let x = 1; x < width - 1; x++) {
+        const i = (y * width + x) * 4;
+
+        const left =
+          (data[i - 4] + data[i - 3] + data[i - 2]) / 3;
+        const right =
+          (data[i + 4] + data[i + 5] + data[i + 6]) / 3;
+
+        const upIndex = i - width * 4;
+        const downIndex = i + width * 4;
+        const up =
+          (data[upIndex] + data[upIndex + 1] + data[upIndex + 2]) / 3;
+        const down =
+          (data[downIndex] + data[downIndex + 1] + data[downIndex + 2]) / 3;
+
+        const gx = right - left;
+        const gy = down - up;
+        sum += gx * gx + gy * gy;
+        count++;
+      }
+    }
+
+    return count ? sum / count : 0;
+  }
+
   const captured = qrBase && centerBase;
 
   return (
     <div style={{ textAlign: "center", padding: "20px" }}>
-      <h2>QR → CDP Extractor (Sharpness & Contrast Controls)</h2>
+      <h2>QR → CDP Extractor (Sharpest Frame Capture)</h2>
 
       <div style={{ position: "relative", display: "inline-block" }}>
         <video
@@ -288,6 +371,21 @@ function App() {
             maxWidth: "500px",
             border: "1px solid #ccc",
             borderRadius: "8px",
+          }}
+        />
+        {/* Fixed bounding box overlay */}
+        <div
+          style={{
+            position: "absolute",
+            top: "50%",
+            left: "50%",
+            transform: "translate(-50%, -50%)",
+            width: `${BOX_FRACTION * 100}%`,
+            height: `${BOX_FRACTION * 100}%`,
+            border: "2px solid #00ff99",
+            borderRadius: "8px",
+            boxSizing: "border-box",
+            pointerEvents: "none",
           }}
         />
         {torchSupported && (
@@ -396,7 +494,7 @@ function App() {
             }}
           >
             <div>
-              <h4>QR crop (raw)</h4>
+              <h4>QR box (raw, sharpest)</h4>
               <img
                 src={qrBase}
                 alt="QR raw"
@@ -410,7 +508,7 @@ function App() {
 
             {qrProcessed && (
               <div>
-                <h4>QR crop (adjusted)</h4>
+                <h4>QR box (adjusted)</h4>
                 <img
                   src={qrProcessed}
                   alt="QR adjusted"
