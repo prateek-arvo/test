@@ -5,7 +5,7 @@ const BOX_FRACTION = 0.5;       // fraction of min(videoWidth, videoHeight) for 
 const CENTER_FRACTION = 0.4;    // center patch from QR crop
 
 // Auto-crop / stability controls
-const STABILITY_FRAMES = 4;     // how many recent frames must agree
+const STABILITY_FRAMES = 2;     // how many recent frames must agree
 const POSITION_TOL_PX = 8;      // allowed movement of QR center
 const SIZE_TOL_RATIO = 0.18;    // allowed size change
 const PADDING_RATIO = 0.05;     // small padding around QR; set 0 for zero extra
