@@ -3,12 +3,16 @@ import { BrowserQRCodeReader } from "@zxing/browser";
 
 function App() {
   const videoRef = useRef(null);
+  const videoTrackRef = useRef(null);
 
   const [result, setResult] = useState("");
   const [qrCropped, setQrCropped] = useState(null);              // Step 1: QR cropped
   const [qrCroppedSharp, setQrCroppedSharp] = useState(null);    // Step 2: QR cropped + sharpened
   const [centerCrop, setCenterCrop] = useState(null);            // Step 3: center 36% from sharpened QR
   const [centerCropSharp, setCenterCropSharp] = useState(null);  // Step 4: sharpened center
+
+  const [torchSupported, setTorchSupported] = useState(false);
+  const [torchOn, setTorchOn] = useState(false);
 
   useEffect(() => {
     const codeReader = new BrowserQRCodeReader();
@@ -27,8 +31,22 @@ function App() {
         });
 
         currentStream = stream;
-        if (!videoRef.current) return;
 
+        // store track for torch control
+        const [track] = stream.getVideoTracks();
+        videoTrackRef.current = track;
+
+        // detect torch support (mostly Chrome Android)
+        try {
+          const caps = track.getCapabilities?.();
+          if (caps && "torch" in caps) {
+            setTorchSupported(true);
+          }
+        } catch {
+          setTorchSupported(false);
+        }
+
+        if (!videoRef.current) return;
         videoRef.current.srcObject = stream;
         videoRef.current.setAttribute("playsinline", true);
         await videoRef.current.play();
@@ -91,7 +109,12 @@ function App() {
             setQrCropped(qrCropUrl);
 
             // ---------- Step 2: sharpen the QR crop ----------
-            const qrImageData = qrCtx.getImageData(0, 0, qrCanvas.width, qrCanvas.height);
+            const qrImageData = qrCtx.getImageData(
+              0,
+              0,
+              qrCanvas.width,
+              qrCanvas.height
+            );
             const qrSharpData = applySharpen(qrImageData);
             qrCtx.putImageData(qrSharpData, 0, 0);
 
@@ -110,8 +133,10 @@ function App() {
 
             if (cx36 < 0) cx36 = 0;
             if (cy36 < 0) cy36 = 0;
-            if (cx36 + size36 > qrCanvas.width) cx36 = qrCanvas.width - size36;
-            if (cy36 + size36 > qrCanvas.height) cy36 = qrCanvas.height - size36;
+            if (cx36 + size36 > qrCanvas.width)
+              cx36 = qrCanvas.width - size36;
+            if (cy36 + size36 > qrCanvas.height)
+              cy36 = qrCanvas.height - size36;
 
             const centerCanvas = document.createElement("canvas");
             const centerCtx = centerCanvas.getContext("2d");
@@ -134,7 +159,12 @@ function App() {
             setCenterCrop(centerUrl);
 
             // ---------- Step 4: sharpen that center crop ----------
-            const centerData = centerCtx.getImageData(0, 0, size36, size36);
+            const centerData = centerCtx.getImageData(
+              0,
+              0,
+              size36,
+              size36
+            );
             const centerSharpData = applySharpen(centerData);
             centerCtx.putImageData(centerSharpData, 0, 0);
 
@@ -146,6 +176,8 @@ function App() {
             if (currentStream) {
               currentStream.getTracks().forEach((t) => t.stop());
             }
+            videoTrackRef.current = null;
+            setTorchOn(false);
           }
         );
       } catch (e) {
@@ -160,8 +192,29 @@ function App() {
       if (currentStream) {
         currentStream.getTracks().forEach((t) => t.stop());
       }
+      videoTrackRef.current = null;
+      setTorchOn(false);
     };
   }, []);
+
+  // Toggle flash/torch if supported
+  const handleToggleTorch = async () => {
+    const track = videoTrackRef.current;
+    if (!track || !track.getCapabilities || !track.applyConstraints) return;
+
+    try {
+      const caps = track.getCapabilities();
+      if (!caps || !caps.torch) return;
+
+      const newValue = !torchOn;
+      await track.applyConstraints({
+        advanced: [{ torch: newValue }],
+      });
+      setTorchOn(newValue);
+    } catch (err) {
+      console.warn("Torch toggle failed or unsupported:", err);
+    }
+  };
 
   // 3x3 sharpen kernel
   function applySharpen(imageData) {
@@ -191,7 +244,7 @@ function App() {
       }
     }
 
-    // Copy untouched for borders: simple handling
+    // Copy untouched borders (simple handling)
     for (let i = 0; i < data.length; i += 4) {
       if (out[i + 3] === 0) {
         out[i] = data[i];
@@ -208,15 +261,37 @@ function App() {
     <div style={{ textAlign: "center", padding: "20px" }}>
       <h2>QR Test App</h2>
 
-      <video
-        ref={videoRef}
-        style={{
-          width: "100%",
-          maxWidth: "500px",
-          border: "1px solid #ccc",
-          borderRadius: "8px",
-        }}
-      />
+      <div style={{ position: "relative", display: "inline-block" }}>
+        <video
+          ref={videoRef}
+          style={{
+            width: "100%",
+            maxWidth: "500px",
+            border: "1px solid #ccc",
+            borderRadius: "8px",
+          }}
+        />
+        {torchSupported && (
+          <button
+            onClick={handleToggleTorch}
+            style={{
+              position: "absolute",
+              bottom: 10,
+              right: 10,
+              padding: "6px 10px",
+              fontSize: "12px",
+              borderRadius: "6px",
+              border: "none",
+              background: torchOn ? "#ffcc00" : "#333",
+              color: torchOn ? "#000" : "#fff",
+              cursor: "pointer",
+              opacity: 0.9,
+            }}
+          >
+            {torchOn ? "Flash ON" : "Flash OFF"}
+          </button>
+        )}
+      </div>
 
       {result && (
         <div style={{ marginTop: "16px" }}>
