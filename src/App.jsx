@@ -14,8 +14,9 @@ function App() {
   const [torchSupported, setTorchSupported] = useState(false);
   const [torchOn, setTorchOn] = useState(false);
 
-  const CENTER_FRACTION = 0.4; // 40% center crop
-  const USE_MILD_SHARPEN = true; // one mild sharpen pass
+  const CENTER_FRACTION = 0.4;       // 40% center crop
+  const USE_UNSHARP = false;         // start with NO sharpening
+  const UNSHARP_AMOUNT = 0.35;       // gentle when enabled
 
   useEffect(() => {
     const codeReader = new BrowserQRCodeReader();
@@ -37,7 +38,7 @@ function App() {
         const [track] = stream.getVideoTracks();
         videoTrackRef.current = track;
 
-        // Detect torch support
+        // Torch capability (Android Chrome mainly)
         try {
           const caps = track.getCapabilities?.();
           if (caps && "torch" in caps) setTorchSupported(true);
@@ -101,20 +102,21 @@ function App() {
             qrCanvas.height = h;
             qrCtx.drawImage(v, x, y, w, h, 0, 0, w, h);
 
+            // Raw QR crop
             const qrCropUrl = qrCanvas.toDataURL("image/png");
             setQrCropped(qrCropUrl);
 
-            // ---------- Step 2: one mild sharpen (keeps brightness) ----------
-            if (USE_MILD_SHARPEN) {
+            // ---------- Step 2: optional unsharp on full QR ----------
+            if (USE_UNSHARP) {
               const imgData = qrCtx.getImageData(0, 0, w, h);
-              const sharpData = applyMildSharpen(imgData);
+              const sharpData = applyUnsharp(imgData, UNSHARP_AMOUNT);
               qrCtx.putImageData(sharpData, 0, 0);
             }
 
             const qrSharpUrl = qrCanvas.toDataURL("image/png");
             setQrCroppedSharp(qrSharpUrl);
 
-            // ---------- Step 3: center 40% (from sharpened QR) ----------
+            // ---------- Step 3: center 40% from processed QR ----------
             const baseSize = Math.min(qrCanvas.width, qrCanvas.height);
             const patchSize = Math.floor(baseSize * CENTER_FRACTION);
 
@@ -151,10 +153,12 @@ function App() {
             const centerUrl = centerCanvas.toDataURL("image/png");
             setCenterCrop(centerUrl);
 
-            // ---------- Step 4: optional second mild sharpen ----------
-            const cData = centerCtx.getImageData(0, 0, patchSize, patchSize);
-            const cSharp = applyMildSharpen(cData);
-            centerCtx.putImageData(cSharp, 0, 0);
+            // ---------- Step 4: optional unsharp on center ----------
+            if (USE_UNSHARP) {
+              const cData = centerCtx.getImageData(0, 0, patchSize, patchSize);
+              const cSharp = applyUnsharp(cData, UNSHARP_AMOUNT);
+              centerCtx.putImageData(cSharp, 0, 0);
+            }
 
             const centerSharpUrl = centerCanvas.toDataURL("image/png");
             setCenterCropSharp(centerSharpUrl);
@@ -185,7 +189,7 @@ function App() {
     };
   }, []);
 
-  // 🔦 Torch control
+  // 🔦 Torch control (Android Chrome, if available)
   const handleToggleTorch = async () => {
     const track = videoTrackRef.current;
     if (!track || !track.getCapabilities || !track.applyConstraints) return;
@@ -195,60 +199,63 @@ function App() {
       if (!caps || !caps.torch) return;
 
       const newValue = !torchOn;
-      await track.applyConstraints({
-        advanced: [{ torch: newValue }],
-      });
+      await track.applyConstraints({ advanced: [{ torch: newValue }] });
       setTorchOn(newValue);
     } catch (err) {
       console.warn("Torch toggle failed or unsupported:", err);
     }
   };
 
-  // --- Mild sharpen that keeps brightness consistent ---
-  function applyMildSharpen(imageData) {
+  // Unsharp mask: out = orig + amount * (orig - blur)
+  // This preserves overall brightness much better than a raw edge kernel.
+  function applyUnsharp(imageData, amount = 0.35) {
     const { width, height, data } = imageData;
-    const out = new Uint8ClampedArray(data.length);
-    const stride = width * 4;
+    const len = data.length;
 
-    const k = [0, -1, 0, -1, 4.1, -1, 0, -1, 0]; // mild kernel
+    // Simple 3x3 box blur
+    const blur = new Uint8ClampedArray(len);
+    const w4 = width * 4;
 
     for (let y = 1; y < height - 1; y++) {
       for (let x = 1; x < width - 1; x++) {
         const idx = (y * width + x) * 4;
         for (let c = 0; c < 3; c++) {
-          const tl = data[idx - stride - 4 + c];
-          const t = data[idx - stride + c];
-          const tr = data[idx - stride + 4 + c];
-          const l = data[idx - 4 + c];
-          const m = data[idx + c];
-          const r = data[idx + 4 + c];
-          const bl = data[idx + stride - 4 + c];
-          const b = data[idx + stride + c];
-          const br = data[idx + stride + 4 + c];
-
-          let val =
-            k[0] * tl +
-            k[1] * t +
-            k[2] * tr +
-            k[3] * l +
-            k[4] * m +
-            k[5] * r +
-            k[6] * bl +
-            k[7] * b +
-            k[8] * br;
-
-          val = Math.max(0, Math.min(255, val));
-          out[idx + c] = val;
+          let sum = 0;
+          sum += data[idx - w4 - 4 + c];
+          sum += data[idx - w4 + c];
+          sum += data[idx - w4 + 4 + c];
+          sum += data[idx - 4 + c];
+          sum += data[idx + c];
+          sum += data[idx + 4 + c];
+          sum += data[idx + w4 - 4 + c];
+          sum += data[idx + w4 + c];
+          sum += data[idx + w4 + 4 + c];
+          blur[idx + c] = sum / 9;
         }
-        out[idx + 3] = data[idx + 3];
+        blur[idx + 3] = data[idx + 3];
       }
     }
+
+    const out = new Uint8ClampedArray(len);
+
+    for (let i = 0; i < len; i += 4) {
+      for (let c = 0; c < 3; c++) {
+        const orig = data[i + c];
+        const b = blur[i + c] || orig;
+        let val = orig + amount * (orig - b);
+        if (val < 0) val = 0;
+        if (val > 255) val = 255;
+        out[i + c] = val;
+      }
+      out[i + 3] = data[i + 3];
+    }
+
     return new ImageData(out, width, height);
   }
 
   return (
     <div style={{ textAlign: "center", padding: "20px" }}>
-      <h2>QR → CDP Extractor (Clean + Bright)</h2>
+      <h2>QR → CDP Extractor</h2>
 
       <div style={{ position: "relative", display: "inline-block" }}>
         <video
@@ -330,10 +337,12 @@ function App() {
 
           {qrCroppedSharp && (
             <div>
-              <h4>QR crop (mild sharpen)</h4>
+              <h4>
+                QR crop {USE_UNSHARP ? "(unsharp)" : "(same as raw)"}
+              </h4>
               <img
                 src={qrCroppedSharp}
-                alt="QR cropped sharpened"
+                alt="QR cropped processed"
                 style={{
                   maxWidth: "180px",
                   borderRadius: "8px",
@@ -345,7 +354,7 @@ function App() {
 
           {centerCrop && (
             <div>
-              <h4>Center 40% (from sharpened QR)</h4>
+              <h4>Center 40% (from processed QR)</h4>
               <img
                 src={centerCrop}
                 alt="Center 40%"
@@ -360,7 +369,9 @@ function App() {
 
           {centerCropSharp && (
             <div>
-              <h4>Center 40% (mild sharpen)</h4>
+              <h4>
+                Center 40% {USE_UNSHARP ? "(unsharp)" : "(same as above)"}
+              </h4>
               <img
                 src={centerCropSharp}
                 alt="Center 40% sharpened"
