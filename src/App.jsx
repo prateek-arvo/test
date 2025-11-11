@@ -76,10 +76,11 @@ function App() {
               const vw = v.videoWidth;
               const vh = v.videoHeight;
 
-              const boxW = Math.floor(vw * BOX_FRACTION);
-              const boxH = Math.floor(vh * BOX_FRACTION);
-              const x = Math.floor((vw - boxW) / 2);
-              const y = Math.floor((vh - boxH) / 2);
+              const boxSize = Math.floor(Math.min(vw, vh) * BOX_FRACTION);
+              const x = Math.floor((vw - boxSize) / 2);
+              const y = Math.floor((vh - boxSize) / 2);
+              const boxW = boxH = boxSize;
+
 
               const canvas = document.createElement("canvas");
               canvas.width = boxW;
@@ -380,8 +381,8 @@ function App() {
             top: "50%",
             left: "50%",
             transform: "translate(-50%, -50%)",
+            aspectRatio: "1 / 1",
             width: `${BOX_FRACTION * 100}%`,
-            height: `${BOX_FRACTION * 100}%`,
             border: "2px solid #00ff99",
             borderRadius: "8px",
             boxSizing: "border-box",
