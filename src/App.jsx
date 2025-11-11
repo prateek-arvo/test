@@ -10,15 +10,18 @@ function App() {
   const [qrBase, setQrBase] = useState(null);
   const [centerBase, setCenterBase] = useState(null);
 
-  const [qrSharp, setQrSharp] = useState(null);
-  const [centerSharp, setCenterSharp] = useState(null);
+  const [qrProcessed, setQrProcessed] = useState(null);
+  const [centerProcessed, setCenterProcessed] = useState(null);
 
   const [torchSupported, setTorchSupported] = useState(false);
   const [torchOn, setTorchOn] = useState(false);
 
-  const [sharpAmount, setSharpAmount] = useState(0.35); // default intensity
+  // Post-capture tuning
+  const [sharpAmount, setSharpAmount] = useState(0.3);    // 0–1
+  const [contrast, setContrast] = useState(1.0);          // 0.5–2
+  const [brightness, setBrightness] = useState(0.0);      // -0.3–0.3
 
-  const CENTER_FRACTION = 0.4; // center crop size
+  const CENTER_FRACTION = 0.4;
 
   useEffect(() => {
     const codeReader = new BrowserQRCodeReader();
@@ -40,6 +43,7 @@ function App() {
         const [track] = stream.getVideoTracks();
         videoTrackRef.current = track;
 
+        // Torch support (Android Chrome)
         try {
           const caps = track.getCapabilities?.();
           if (caps && "torch" in caps) setTorchSupported(true);
@@ -66,6 +70,7 @@ function App() {
             const vw = v.videoWidth;
             const vh = v.videoHeight;
 
+            // --- QR crop (bbox + padding) ---
             const pts =
               (res.getResultPoints && res.getResultPoints()) ||
               res.resultPoints ||
@@ -75,12 +80,10 @@ function App() {
             if (pts && pts.length >= 3) {
               const xs = pts.map((p) => (p.getX ? p.getX() : p.x));
               const ys = pts.map((p) => (p.getY ? p.getY() : p.y));
-
               const minX = Math.min(...xs);
               const maxX = Math.max(...xs);
               const minY = Math.min(...ys);
               const maxY = Math.max(...ys);
-
               const boxW = maxX - minX;
               const boxH = maxY - minY;
               const pad = 0.15 * Math.max(boxW, boxH);
@@ -97,14 +100,14 @@ function App() {
             }
 
             const qrCanvas = document.createElement("canvas");
-            const qrCtx = qrCanvas.getContext("2d");
             qrCanvas.width = w;
             qrCanvas.height = h;
+            const qrCtx = qrCanvas.getContext("2d");
             qrCtx.drawImage(v, x, y, w, h, 0, 0, w, h);
             const qrUrl = qrCanvas.toDataURL("image/png");
             setQrBase(qrUrl);
 
-            // Center crop
+            // --- Center 40% from QR ---
             const baseSize = Math.min(w, h);
             const patchSize = Math.floor(baseSize * CENTER_FRACTION);
             const cx = Math.floor(w / 2);
@@ -117,9 +120,9 @@ function App() {
             if (py + patchSize > h) py = h - patchSize;
 
             const centerCanvas = document.createElement("canvas");
-            const centerCtx = centerCanvas.getContext("2d");
             centerCanvas.width = patchSize;
             centerCanvas.height = patchSize;
+            const centerCtx = centerCanvas.getContext("2d");
             centerCtx.drawImage(
               qrCanvas,
               px,
@@ -134,12 +137,11 @@ function App() {
             const centerUrl = centerCanvas.toDataURL("image/png");
             setCenterBase(centerUrl);
 
-            // Initialize sharpened previews
-            setQrSharp(applySharpenToURL(qrUrl, sharpAmount));
-            setCenterSharp(applySharpenToURL(centerUrl, sharpAmount));
-
+            // Stop camera after capture
             if (controls) controls.stop();
-            if (currentStream) currentStream.getTracks().forEach((t) => t.stop());
+            if (currentStream) {
+              currentStream.getTracks().forEach((t) => t.stop());
+            }
             videoTrackRef.current = null;
             setTorchOn(false);
           }
@@ -161,7 +163,7 @@ function App() {
     };
   }, []);
 
-  // 🔦 Torch toggle
+  // Torch toggle
   const handleToggleTorch = async () => {
     const track = videoTrackRef.current;
     if (!track || !track.getCapabilities || !track.applyConstraints) return;
@@ -176,40 +178,66 @@ function App() {
     }
   };
 
-  // --------- Sharpen helpers ---------
-  const applySharpenToURL = (url, amount) => {
-    const img = new Image();
-    img.src = url;
-    const canvas = document.createElement("canvas");
-    const ctx = canvas.getContext("2d");
-    return new Promise((resolve) => {
-      img.onload = () => {
-        canvas.width = img.width;
-        canvas.height = img.height;
-        ctx.drawImage(img, 0, 0);
-        const data = ctx.getImageData(0, 0, img.width, img.height);
-        const sharpened = applyUnsharp(data, amount);
-        ctx.putImageData(sharpened, 0, 0);
-        resolve(canvas.toDataURL("image/png"));
-      };
-    });
-  };
+  // Recompute processed previews whenever sliders or base images change
+  useEffect(() => {
+    if (!qrBase) return;
+    processImage(qrBase, sharpAmount, contrast, brightness, setQrProcessed);
+  }, [qrBase, sharpAmount, contrast, brightness]);
 
   useEffect(() => {
-    if (!qrBase || !centerBase) return;
-    (async () => {
-      const q = await applySharpenToURL(qrBase, sharpAmount);
-      const c = await applySharpenToURL(centerBase, sharpAmount);
-      setQrSharp(q);
-      setCenterSharp(c);
-    })();
-  }, [sharpAmount, qrBase, centerBase]);
+    if (!centerBase) return;
+    processImage(centerBase, sharpAmount, contrast, brightness, setCenterProcessed);
+  }, [centerBase, sharpAmount, contrast, brightness]);
 
-  function applyUnsharp(imageData, amount = 0.35) {
+  // Apply brightness + contrast + unsharp
+  function processImage(url, sharpAmt, contrastVal, brightnessVal, cb) {
+    const img = new Image();
+    img.src = url;
+    img.onload = () => {
+      const canvas = document.createElement("canvas");
+      const ctx = canvas.getContext("2d");
+      canvas.width = img.width;
+      canvas.height = img.height;
+      ctx.drawImage(img, 0, 0);
+
+      let imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      imgData = applyBrightnessContrast(imgData, contrastVal, brightnessVal);
+      if (sharpAmt > 0.001) {
+        imgData = applyUnsharp(imgData, sharpAmt);
+      }
+      ctx.putImageData(imgData, 0, 0);
+      cb(canvas.toDataURL("image/png"));
+    };
+  }
+
+  // Brightness [-0.5,0.5], Contrast [0.5,2]
+  function applyBrightnessContrast(imageData, contrastVal, brightnessVal) {
+    const { data } = imageData;
+    // contrast formula around mid-point:
+    // new = ((old/255 - 0.5) * contrast + 0.5 + brightness) * 255
+    for (let i = 0; i < data.length; i += 4) {
+      for (let c = 0; c < 3; c++) {
+        const old = data[i + c] / 255;
+        let val =
+          (old - 0.5) * contrastVal +
+          0.5 +
+          brightnessVal;
+        if (val < 0) val = 0;
+        if (val > 1) val = 1;
+        data[i + c] = Math.round(val * 255);
+      }
+    }
+    return imageData;
+  }
+
+  // Unsharp mask (gentle)
+  function applyUnsharp(imageData, amount = 0.3) {
     const { width, height, data } = imageData;
     const len = data.length;
     const blur = new Uint8ClampedArray(len);
     const w4 = width * 4;
+
+    // simple 3x3 box blur
     for (let y = 1; y < height - 1; y++) {
       for (let x = 1; x < width - 1; x++) {
         const idx = (y * width + x) * 4;
@@ -236,11 +264,13 @@ function App() {
         const orig = data[i + c];
         const b = blur[i + c] || orig;
         let val = orig + amount * (orig - b);
-        val = Math.max(0, Math.min(255, val));
+        if (val < 0) val = 0;
+        if (val > 255) val = 255;
         out[i + c] = val;
       }
       out[i + 3] = data[i + 3];
     }
+
     return new ImageData(out, width, height);
   }
 
@@ -248,7 +278,7 @@ function App() {
 
   return (
     <div style={{ textAlign: "center", padding: "20px" }}>
-      <h2>QR → CDP Extractor (Adjustable Sharpness)</h2>
+      <h2>QR → CDP Extractor (Sharpness & Contrast Controls)</h2>
 
       <div style={{ position: "relative", display: "inline-block" }}>
         <video
@@ -302,19 +332,58 @@ function App() {
 
       {captured && (
         <>
-          <div style={{ marginTop: "20px" }}>
-            <label>
-              <b>Sharpness: </b>{sharpAmount.toFixed(2)}
-            </label>
-            <input
-              type="range"
-              min="0"
-              max="1"
-              step="0.05"
-              value={sharpAmount}
-              onChange={(e) => setSharpAmount(parseFloat(e.target.value))}
-              style={{ width: "250px", marginLeft: "10px" }}
-            />
+          <div
+            style={{
+              marginTop: "20px",
+              display: "flex",
+              flexDirection: "column",
+              gap: "8px",
+              alignItems: "center",
+              fontSize: "13px",
+            }}
+          >
+            <div>
+              <label>Sharpness ({sharpAmount.toFixed(2)}): </label>
+              <input
+                type="range"
+                min="0"
+                max="1"
+                step="0.05"
+                value={sharpAmount}
+                onChange={(e) =>
+                  setSharpAmount(parseFloat(e.target.value))
+                }
+                style={{ width: "260px", marginLeft: "6px" }}
+              />
+            </div>
+            <div>
+              <label>Contrast ({contrast.toFixed(2)}): </label>
+              <input
+                type="range"
+                min="0.5"
+                max="2"
+                step="0.05"
+                value={contrast}
+                onChange={(e) =>
+                  setContrast(parseFloat(e.target.value))
+                }
+                style={{ width: "260px", marginLeft: "6px" }}
+              />
+            </div>
+            <div>
+              <label>Brightness ({brightness.toFixed(2)}): </label>
+              <input
+                type="range"
+                min="-0.3"
+                max="0.3"
+                step="0.02"
+                value={brightness}
+                onChange={(e) =>
+                  setBrightness(parseFloat(e.target.value))
+                }
+                style={{ width: "260px", marginLeft: "6px" }}
+              />
+            </div>
           </div>
 
           <div
@@ -339,24 +408,26 @@ function App() {
               />
             </div>
 
-            <div>
-              <h4>QR crop (adjusted)</h4>
-              <img
-                src={qrSharp}
-                alt="QR sharpened"
-                style={{
-                  maxWidth: "180px",
-                  borderRadius: "8px",
-                  border: "1px solid #ddd",
-                }}
-              />
-            </div>
+            {qrProcessed && (
+              <div>
+                <h4>QR crop (adjusted)</h4>
+                <img
+                  src={qrProcessed}
+                  alt="QR adjusted"
+                  style={{
+                    maxWidth: "180px",
+                    borderRadius: "8px",
+                    border: "1px solid #ddd",
+                  }}
+                />
+              </div>
+            )}
 
             <div>
               <h4>Center 40% (raw)</h4>
               <img
                 src={centerBase}
-                alt="center raw"
+                alt="Center raw"
                 style={{
                   maxWidth: "180px",
                   borderRadius: "8px",
@@ -365,18 +436,20 @@ function App() {
               />
             </div>
 
-            <div>
-              <h4>Center 40% (adjusted)</h4>
-              <img
-                src={centerSharp}
-                alt="center sharpened"
-                style={{
-                  maxWidth: "180px",
-                  borderRadius: "8px",
-                  border: "1px solid #ddd",
-                }}
-              />
-            </div>
+            {centerProcessed && (
+              <div>
+                <h4>Center 40% (adjusted)</h4>
+                <img
+                  src={centerProcessed}
+                  alt="Center adjusted"
+                  style={{
+                    maxWidth: "180px",
+                    borderRadius: "8px",
+                    border: "1px solid #ddd",
+                  }}
+                />
+              </div>
+            )}
           </div>
         </>
       )}
