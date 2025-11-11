@@ -3,16 +3,14 @@ import { BrowserQRCodeReader } from "@zxing/browser";
 
 function App() {
   const videoRef = useRef(null);
-  const videoTrackRef = useRef(null);
 
   const [result, setResult] = useState("");
-  const [qrCropped, setQrCropped] = useState(null);              // Step 1: QR cropped
-  const [qrCroppedSharp, setQrCroppedSharp] = useState(null);    // Step 2: QR cropped + sharpened
-  const [centerCrop, setCenterCrop] = useState(null);            // Step 3: center 36% from sharpened QR
-  const [centerCropSharp, setCenterCropSharp] = useState(null);  // Step 4: sharpened center
+  const [qrCropped, setQrCropped] = useState(null);      // QR crop (after optional sharpen)
+  const [centerCrop, setCenterCrop] = useState(null);    // Center patch from QR (no extra sharpen)
 
-  const [torchSupported, setTorchSupported] = useState(false);
-  const [torchOn, setTorchOn] = useState(false);
+  // Toggle this to compare behavior
+  const USE_MILD_SHARPEN = true;
+  const CENTER_FRACTION = 0.5; // 50% center patch (safer than 36%)
 
   useEffect(() => {
     const codeReader = new BrowserQRCodeReader();
@@ -25,26 +23,12 @@ function App() {
         const stream = await navigator.mediaDevices.getUserMedia({
           video: {
             facingMode: "environment",
-            width: { ideal: 1920 },
-            height: { ideal: 1080 },
+            width: { ideal: 2560 },
+            height: { ideal: 1440 },
           },
         });
 
         currentStream = stream;
-
-        // store track for torch control
-        const [track] = stream.getVideoTracks();
-        videoTrackRef.current = track;
-
-        // detect torch support (mostly Chrome Android)
-        try {
-          const caps = track.getCapabilities?.();
-          if (caps && "torch" in caps) {
-            setTorchSupported(true);
-          }
-        } catch {
-          setTorchSupported(false);
-        }
 
         if (!videoRef.current) return;
         videoRef.current.srcObject = stream;
@@ -81,21 +65,19 @@ function App() {
               const minY = Math.min(...ys);
               const maxY = Math.max(...ys);
 
-              x = minX;
-              y = minY;
-              w = maxX - minX;
-              h = maxY - minY;
+              const boxW = maxX - minX;
+              const boxH = maxY - minY;
+              const pad = 0.15 * Math.max(boxW, boxH); // 15% padding
 
-              const pad = 0.15 * Math.max(w, h); // 15% padding
-              x = Math.max(0, x - pad);
-              y = Math.max(0, y - pad);
-              w = Math.min(vw - x, w + pad * 2);
-              h = Math.min(vh - y, h + pad * 2);
+              x = Math.max(0, Math.floor(minX - pad));
+              y = Math.max(0, Math.floor(minY - pad));
+              w = Math.min(vw - x, Math.floor(boxW + pad * 2));
+              h = Math.min(vh - y, Math.floor(boxH + pad * 2));
             } else {
-              // Fallback: center box
-              const size = Math.min(vw, vh) * 0.5;
-              x = (vw - size) / 2;
-              y = (vh - size) / 2;
+              // Fallback: center box, still integer + safe
+              const size = Math.floor(Math.min(vw, vh) * 0.5);
+              x = Math.floor((vw - size) / 2);
+              y = Math.floor((vh - size) / 2);
               w = h = size;
             }
 
@@ -103,81 +85,60 @@ function App() {
             const qrCtx = qrCanvas.getContext("2d");
             qrCanvas.width = w;
             qrCanvas.height = h;
+
             qrCtx.drawImage(v, x, y, w, h, 0, 0, w, h);
 
-            const qrCropUrl = qrCanvas.toDataURL("image/png");
-            setQrCropped(qrCropUrl);
+            // ---------- Step 2: [optional] mild sharpen on full QR once ----------
+            if (USE_MILD_SHARPEN) {
+              const qrImageData = qrCtx.getImageData(0, 0, w, h);
+              const qrSharpData = applyMildSharpen(qrImageData);
+              qrCtx.putImageData(qrSharpData, 0, 0);
+            }
 
-            // ---------- Step 2: sharpen the QR crop ----------
-            const qrImageData = qrCtx.getImageData(
-              0,
-              0,
-              qrCanvas.width,
-              qrCanvas.height
-            );
-            const qrSharpData = applySharpen(qrImageData);
-            qrCtx.putImageData(qrSharpData, 0, 0);
+            setQrCropped(qrCanvas.toDataURL("image/png"));
 
-            const qrSharpUrl = qrCanvas.toDataURL("image/png");
-            setQrCroppedSharp(qrSharpUrl);
-
-            // ---------- Step 3: center 36% from sharpened QR ----------
+            // ---------- Step 3: center patch from (possibly sharpened) QR ----------
             const baseSize = Math.min(qrCanvas.width, qrCanvas.height);
-            const size36 = 0.36 * baseSize;
+            const patchSize = Math.floor(baseSize * CENTER_FRACTION);
 
-            const cx = qrCanvas.width / 2;
-            const cy = qrCanvas.height / 2;
+            const cx = Math.floor(qrCanvas.width / 2);
+            const cy = Math.floor(qrCanvas.height / 2);
 
-            let cx36 = cx - size36 / 2;
-            let cy36 = cy - size36 / 2;
+            let px = cx - Math.floor(patchSize / 2);
+            let py = cy - Math.floor(patchSize / 2);
 
-            if (cx36 < 0) cx36 = 0;
-            if (cy36 < 0) cy36 = 0;
-            if (cx36 + size36 > qrCanvas.width)
-              cx36 = qrCanvas.width - size36;
-            if (cy36 + size36 > qrCanvas.height)
-              cy36 = qrCanvas.height - size36;
+            if (px < 0) px = 0;
+            if (py < 0) py = 0;
+            if (px + patchSize > qrCanvas.width)
+              px = qrCanvas.width - patchSize;
+            if (py + patchSize > qrCanvas.height)
+              py = qrCanvas.height - patchSize;
 
             const centerCanvas = document.createElement("canvas");
             const centerCtx = centerCanvas.getContext("2d");
-            centerCanvas.width = size36;
-            centerCanvas.height = size36;
+            centerCanvas.width = patchSize;
+            centerCanvas.height = patchSize;
 
             centerCtx.drawImage(
               qrCanvas,
-              cx36,
-              cy36,
-              size36,
-              size36,
+              px,
+              py,
+              patchSize,
+              patchSize,
               0,
               0,
-              size36,
-              size36
+              patchSize,
+              patchSize
             );
 
-            const centerUrl = centerCanvas.toDataURL("image/png");
-            setCenterCrop(centerUrl);
-
-            // ---------- Step 4: sharpen that center crop ----------
-            const centerData = centerCtx.getImageData(
-              0,
-              0,
-              size36,
-              size36
-            );
-            const centerSharpData = applySharpen(centerData);
-            centerCtx.putImageData(centerSharpData, 0, 0);
-
-            const centerSharpUrl = centerCanvas.toDataURL("image/png");
-            setCenterCropSharp(centerSharpUrl);
+            // No extra sharpen here: keep CDP structure intact
+            setCenterCrop(centerCanvas.toDataURL("image/png"));
 
             // ---------- Cleanup ----------
             if (controls) controls.stop();
             if (currentStream) {
               currentStream.getTracks().forEach((t) => t.stop());
             }
-            videoTrackRef.current = null;
-            setTorchOn(false);
           }
         );
       } catch (e) {
@@ -192,59 +153,54 @@ function App() {
       if (currentStream) {
         currentStream.getTracks().forEach((t) => t.stop());
       }
-      videoTrackRef.current = null;
-      setTorchOn(false);
     };
   }, []);
 
-  // Toggle flash/torch if supported
-  const handleToggleTorch = async () => {
-    const track = videoTrackRef.current;
-    if (!track || !track.getCapabilities || !track.applyConstraints) return;
-
-    try {
-      const caps = track.getCapabilities();
-      if (!caps || !caps.torch) return;
-
-      const newValue = !torchOn;
-      await track.applyConstraints({
-        advanced: [{ torch: newValue }],
-      });
-      setTorchOn(newValue);
-    } catch (err) {
-      console.warn("Torch toggle failed or unsupported:", err);
-    }
-  };
-
-  // 3x3 sharpen kernel
-  function applySharpen(imageData) {
+  // Mild sharpen (less aggressive than classic 0 -1 0 / -1 5 -1 / 0 -1 0)
+  // Center weight tuned to 4.2 instead of 5 to reduce haloing.
+  function applyMildSharpen(imageData) {
     const { width, height, data } = imageData;
     const out = new Uint8ClampedArray(data.length);
     const stride = width * 4;
-    const k = [0, -1, 0, -1, 5, -1, 0, -1, 0];
+
+    const k = [0, -1, 0, -1, 4.2, -1, 0, -1, 0];
 
     for (let y = 1; y < height - 1; y++) {
       for (let x = 1; x < width - 1; x++) {
         const idx = (y * width + x) * 4;
-        for (let c = 0; c < 3; c++) {
-          let sum =
-            data[idx - stride - 4 + c] * k[0] +
-            data[idx - stride + c] * k[1] +
-            data[idx - stride + 4 + c] * k[2] +
-            data[idx - 4 + c] * k[3] +
-            data[idx + c] * k[4] +
-            data[idx + 4 + c] * k[5] +
-            data[idx + stride - 4 + c] * k[6] +
-            data[idx + stride + c] * k[7] +
-            data[idx + stride + 4 + c] * k[8];
 
-          out[idx + c] = Math.max(0, Math.min(255, sum));
+        for (let c = 0; c < 3; c++) {
+          const tl = data[idx - stride - 4 + c];
+          const t = data[idx - stride + c];
+          const tr = data[idx - stride + 4 + c];
+          const l = data[idx - 4 + c];
+          const m = data[idx + c];
+          const r = data[idx + 4 + c];
+          const bl = data[idx + stride - 4 + c];
+          const b = data[idx + stride + c];
+          const br = data[idx + stride + 4 + c];
+
+          let val =
+            k[0] * tl +
+            k[1] * t +
+            k[2] * tr +
+            k[3] * l +
+            k[4] * m +
+            k[5] * r +
+            k[6] * bl +
+            k[7] * b +
+            k[8] * br;
+
+          if (val < 0) val = 0;
+          if (val > 255) val = 255;
+          out[idx + c] = val;
         }
+
         out[idx + 3] = data[idx + 3]; // alpha
       }
     }
 
-    // Copy untouched borders (simple handling)
+    // Copy borders unchanged
     for (let i = 0; i < data.length; i += 4) {
       if (out[i + 3] === 0) {
         out[i] = data[i];
@@ -259,39 +215,17 @@ function App() {
 
   return (
     <div style={{ textAlign: "center", padding: "20px" }}>
-      <h2>QR Test App</h2>
+      <h2>QR CDP Extractor</h2>
 
-      <div style={{ position: "relative", display: "inline-block" }}>
-        <video
-          ref={videoRef}
-          style={{
-            width: "100%",
-            maxWidth: "500px",
-            border: "1px solid #ccc",
-            borderRadius: "8px",
-          }}
-        />
-        {torchSupported && (
-          <button
-            onClick={handleToggleTorch}
-            style={{
-              position: "absolute",
-              bottom: 10,
-              right: 10,
-              padding: "6px 10px",
-              fontSize: "12px",
-              borderRadius: "6px",
-              border: "none",
-              background: torchOn ? "#ffcc00" : "#333",
-              color: torchOn ? "#000" : "#fff",
-              cursor: "pointer",
-              opacity: 0.9,
-            }}
-          >
-            {torchOn ? "Flash ON" : "Flash OFF"}
-          </button>
-        )}
-      </div>
+      <video
+        ref={videoRef}
+        style={{
+          width: "100%",
+          maxWidth: "500px",
+          border: "1px solid #ccc",
+          borderRadius: "8px",
+        }}
+      />
 
       {result && (
         <div style={{ marginTop: "16px" }}>
@@ -311,7 +245,7 @@ function App() {
         </div>
       )}
 
-      {(qrCropped || qrCroppedSharp || centerCrop || centerCropSharp) && (
+      {(qrCropped || centerCrop) && (
         <div
           style={{
             display: "flex",
@@ -323,27 +257,12 @@ function App() {
         >
           {qrCropped && (
             <div>
-              <h4>QR crop</h4>
+              <h4>QR crop {USE_MILD_SHARPEN ? "(mild sharpen)" : ""}</h4>
               <img
                 src={qrCropped}
                 alt="QR cropped"
                 style={{
-                  maxWidth: "180px",
-                  borderRadius: "8px",
-                  border: "1px solid #ddd",
-                }}
-              />
-            </div>
-          )}
-
-          {qrCroppedSharp && (
-            <div>
-              <h4>QR crop (sharpened)</h4>
-              <img
-                src={qrCroppedSharp}
-                alt="QR cropped sharpened"
-                style={{
-                  maxWidth: "180px",
+                  maxWidth: "200px",
                   borderRadius: "8px",
                   border: "1px solid #ddd",
                 }}
@@ -353,31 +272,25 @@ function App() {
 
           {centerCrop && (
             <div>
-              <h4>Center 36% (from sharpened QR)</h4>
+              <h4>Center {CENTER_FRACTION * 100}% (no extra sharpen)</h4>
               <img
                 src={centerCrop}
-                alt="Center 36%"
+                alt="Center patch"
                 style={{
-                  maxWidth: "180px",
+                  maxWidth: "200px",
                   borderRadius: "8px",
                   border: "1px solid #ddd",
                 }}
               />
-            </div>
-          )}
-
-          {centerCropSharp && (
-            <div>
-              <h4>Center 36% (sharpened)</h4>
-              <img
-                src={centerCropSharp}
-                alt="Center 36% sharpened"
+              <p
                 style={{
-                  maxWidth: "180px",
-                  borderRadius: "8px",
-                  border: "1px solid #ddd",
+                  fontSize: "11px",
+                  color: "#666",
+                  marginTop: "4px",
                 }}
-              />
+              >
+                Use this patch as Siamese CNN input.
+              </p>
             </div>
           )}
         </div>
