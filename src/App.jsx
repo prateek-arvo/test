@@ -6,17 +6,21 @@ function App() {
   const videoTrackRef = useRef(null);
 
   const [result, setResult] = useState("");
-  const [qrCropped, setQrCropped] = useState(null);
-  const [qrCroppedSharp, setQrCroppedSharp] = useState(null);
-  const [centerCrop, setCenterCrop] = useState(null);
-  const [centerCropSharp, setCenterCropSharp] = useState(null);
+
+  const [qrBase, setQrBase] = useState(null);
+  const [qrSharp, setQrSharp] = useState(null);
+  const [centerBase, setCenterBase] = useState(null);
+  const [centerSharp, setCenterSharp] = useState(null);
 
   const [torchSupported, setTorchSupported] = useState(false);
   const [torchOn, setTorchOn] = useState(false);
 
-  const CENTER_FRACTION = 0.4;       // 40% center crop
-  const USE_UNSHARP = false;         // start with NO sharpening
-  const UNSHARP_AMOUNT = 0.35;       // gentle when enabled
+  // UI toggles (post-capture)
+  const [useQrSharpen, setUseQrSharpen] = useState(false);
+  const [useCenterSharpen, setUseCenterSharpen] = useState(false);
+
+  const CENTER_FRACTION = 0.4; // 40% center crop
+  const UNSHARP_AMOUNT = 0.35; // gentle
 
   useEffect(() => {
     const codeReader = new BrowserQRCodeReader();
@@ -38,7 +42,7 @@ function App() {
         const [track] = stream.getVideoTracks();
         videoTrackRef.current = track;
 
-        // Torch capability (Android Chrome mainly)
+        // Torch capability (Android Chrome)
         try {
           const caps = track.getCapabilities?.();
           if (caps && "torch" in caps) setTorchSupported(true);
@@ -65,7 +69,7 @@ function App() {
             const vw = v.videoWidth;
             const vh = v.videoHeight;
 
-            // ---------- Step 1: crop QR (bbox + padding) ----------
+            // ---------- Step 1: QR crop (bbox + padding) ----------
             const pts =
               (res.getResultPoints && res.getResultPoints()) ||
               res.resultPoints ||
@@ -97,47 +101,43 @@ function App() {
             }
 
             const qrCanvas = document.createElement("canvas");
-            const qrCtx = qrCanvas.getContext("2d");
             qrCanvas.width = w;
             qrCanvas.height = h;
+            const qrCtx = qrCanvas.getContext("2d");
             qrCtx.drawImage(v, x, y, w, h, 0, 0, w, h);
 
-            // Raw QR crop
-            const qrCropUrl = qrCanvas.toDataURL("image/png");
-            setQrCropped(qrCropUrl);
+            const qrBaseUrl = qrCanvas.toDataURL("image/png");
+            setQrBase(qrBaseUrl);
 
-            // ---------- Step 2: optional unsharp on full QR ----------
-            if (USE_UNSHARP) {
-              const imgData = qrCtx.getImageData(0, 0, w, h);
-              const sharpData = applyUnsharp(imgData, UNSHARP_AMOUNT);
-              qrCtx.putImageData(sharpData, 0, 0);
-            }
+            // ---------- Step 2: Sharpened QR (separate canvas) ----------
+            const qrImgData = qrCtx.getImageData(0, 0, w, h);
+            const qrSharpData = applyUnsharp(qrImgData, UNSHARP_AMOUNT);
+            const qrSharpCanvas = document.createElement("canvas");
+            qrSharpCanvas.width = w;
+            qrSharpCanvas.height = h;
+            qrSharpCanvas.getContext("2d").putImageData(qrSharpData, 0, 0);
+            const qrSharpUrl = qrSharpCanvas.toDataURL("image/png");
+            setQrSharp(qrSharpUrl);
 
-            const qrSharpUrl = qrCanvas.toDataURL("image/png");
-            setQrCroppedSharp(qrSharpUrl);
-
-            // ---------- Step 3: center 40% from processed QR ----------
-            const baseSize = Math.min(qrCanvas.width, qrCanvas.height);
+            // ---------- Step 3: Center 40% from *base* QR ----------
+            const baseSize = Math.min(w, h);
             const patchSize = Math.floor(baseSize * CENTER_FRACTION);
 
-            const cx = Math.floor(qrCanvas.width / 2);
-            const cy = Math.floor(qrCanvas.height / 2);
+            const cx = Math.floor(w / 2);
+            const cy = Math.floor(h / 2);
 
             let px = cx - Math.floor(patchSize / 2);
             let py = cy - Math.floor(patchSize / 2);
 
             if (px < 0) px = 0;
             if (py < 0) py = 0;
-            if (px + patchSize > qrCanvas.width)
-              px = qrCanvas.width - patchSize;
-            if (py + patchSize > qrCanvas.height)
-              py = qrCanvas.height - patchSize;
+            if (px + patchSize > w) px = w - patchSize;
+            if (py + patchSize > h) py = h - patchSize;
 
             const centerCanvas = document.createElement("canvas");
-            const centerCtx = centerCanvas.getContext("2d");
             centerCanvas.width = patchSize;
             centerCanvas.height = patchSize;
-
+            const centerCtx = centerCanvas.getContext("2d");
             centerCtx.drawImage(
               qrCanvas,
               px,
@@ -150,20 +150,26 @@ function App() {
               patchSize
             );
 
-            const centerUrl = centerCanvas.toDataURL("image/png");
-            setCenterCrop(centerUrl);
+            const centerBaseUrl = centerCanvas.toDataURL("image/png");
+            setCenterBase(centerBaseUrl);
 
-            // ---------- Step 4: optional unsharp on center ----------
-            if (USE_UNSHARP) {
-              const cData = centerCtx.getImageData(0, 0, patchSize, patchSize);
-              const cSharp = applyUnsharp(cData, UNSHARP_AMOUNT);
-              centerCtx.putImageData(cSharp, 0, 0);
-            }
+            // ---------- Step 4: Sharpened center (from base center) ----------
+            const cData = centerCtx.getImageData(0, 0, patchSize, patchSize);
+            const cSharpData = applyUnsharp(cData, UNSHARP_AMOUNT);
+            const centerSharpCanvas = document.createElement("canvas");
+            centerSharpCanvas.width = patchSize;
+            centerSharpCanvas.height = patchSize;
+            centerSharpCanvas
+              .getContext("2d")
+              .putImageData(cSharpData, 0, 0);
+            const centerSharpUrl = centerSharpCanvas.toDataURL("image/png");
+            setCenterSharp(centerSharpUrl);
 
-            const centerSharpUrl = centerCanvas.toDataURL("image/png");
-            setCenterCropSharp(centerSharpUrl);
+            // Default toggles off so you see raw first
+            setUseQrSharpen(false);
+            setUseCenterSharpen(false);
 
-            // ---------- Cleanup ----------
+            // ---------- Cleanup camera ----------
             if (controls) controls.stop();
             if (currentStream) {
               currentStream.getTracks().forEach((t) => t.stop());
@@ -189,7 +195,7 @@ function App() {
     };
   }, []);
 
-  // 🔦 Torch control (Android Chrome, if available)
+  // 🔦 Torch toggle (Android Chrome where supported)
   const handleToggleTorch = async () => {
     const track = videoTrackRef.current;
     if (!track || !track.getCapabilities || !track.applyConstraints) return;
@@ -207,15 +213,14 @@ function App() {
   };
 
   // Unsharp mask: out = orig + amount * (orig - blur)
-  // This preserves overall brightness much better than a raw edge kernel.
+  // Gentle, brightness-preserving, safe for comparison.
   function applyUnsharp(imageData, amount = 0.35) {
     const { width, height, data } = imageData;
     const len = data.length;
-
-    // Simple 3x3 box blur
     const blur = new Uint8ClampedArray(len);
     const w4 = width * 4;
 
+    // 3x3 box blur (very cheap)
     for (let y = 1; y < height - 1; y++) {
       for (let x = 1; x < width - 1; x++) {
         const idx = (y * width + x) * 4;
@@ -253,9 +258,12 @@ function App() {
     return new ImageData(out, width, height);
   }
 
+  const hasCaptured =
+    qrBase || qrSharp || centerBase || centerSharp;
+
   return (
     <div style={{ textAlign: "center", padding: "20px" }}>
-      <h2>QR → CDP Extractor</h2>
+      <h2>QR → CDP Extractor (with toggles)</h2>
 
       <div style={{ position: "relative", display: "inline-block" }}>
         <video
@@ -307,83 +315,113 @@ function App() {
         </div>
       )}
 
-      {(qrCropped ||
-        qrCroppedSharp ||
-        centerCrop ||
-        centerCropSharp) && (
-        <div
-          style={{
-            display: "flex",
-            justifyContent: "center",
-            gap: "18px",
-            flexWrap: "wrap",
-            marginTop: "20px",
-          }}
-        >
-          {qrCropped && (
-            <div>
-              <h4>QR crop (raw)</h4>
-              <img
-                src={qrCropped}
-                alt="QR cropped"
-                style={{
-                  maxWidth: "180px",
-                  borderRadius: "8px",
-                  border: "1px solid #ddd",
-                }}
-              />
-            </div>
-          )}
+      {hasCaptured && (
+        <>
+          {/* Toggles appear only after capture */}
+          <div
+            style={{
+              marginTop: "16px",
+              display: "flex",
+              justifyContent: "center",
+              gap: "24px",
+              flexWrap: "wrap",
+              fontSize: "13px",
+            }}
+          >
+            <label>
+              <input
+                type="checkbox"
+                checked={useQrSharpen}
+                onChange={(e) => setUseQrSharpen(e.target.checked)}
+              />{" "}
+              Show sharpened QR crop
+            </label>
+            <label>
+              <input
+                type="checkbox"
+                checked={useCenterSharpen}
+                onChange={(e) =>
+                  setUseCenterSharpen(e.target.checked)
+                }
+              />{" "}
+              Show sharpened center crop
+            </label>
+          </div>
 
-          {qrCroppedSharp && (
-            <div>
-              <h4>
-                QR crop {USE_UNSHARP ? "(unsharp)" : "(same as raw)"}
-              </h4>
-              <img
-                src={qrCroppedSharp}
-                alt="QR cropped processed"
-                style={{
-                  maxWidth: "180px",
-                  borderRadius: "8px",
-                  border: "1px solid #ddd",
-                }}
-              />
-            </div>
-          )}
+          <div
+            style={{
+              display: "flex",
+              justifyContent: "center",
+              gap: "18px",
+              flexWrap: "wrap",
+              marginTop: "20px",
+            }}
+          >
+            {/* QR base */}
+            {qrBase && (
+              <div>
+                <h4>QR crop (raw)</h4>
+                <img
+                  src={qrBase}
+                  alt="QR cropped raw"
+                  style={{
+                    maxWidth: "180px",
+                    borderRadius: "8px",
+                    border: "1px solid #ddd",
+                  }}
+                />
+              </div>
+            )}
 
-          {centerCrop && (
-            <div>
-              <h4>Center 40% (from processed QR)</h4>
-              <img
-                src={centerCrop}
-                alt="Center 40%"
-                style={{
-                  maxWidth: "180px",
-                  borderRadius: "8px",
-                  border: "1px solid #ddd",
-                }}
-              />
-            </div>
-          )}
+            {/* QR sharpened (toggle) */}
+            {qrSharp && useQrSharpen && (
+              <div>
+                <h4>QR crop (sharpened)</h4>
+                <img
+                  src={qrSharp}
+                  alt="QR cropped sharpened"
+                  style={{
+                    maxWidth: "180px",
+                    borderRadius: "8px",
+                    border: "1px solid #ddd",
+                  }}
+                />
+              </div>
+            )}
 
-          {centerCropSharp && (
-            <div>
-              <h4>
-                Center 40% {USE_UNSHARP ? "(unsharp)" : "(same as above)"}
-              </h4>
-              <img
-                src={centerCropSharp}
-                alt="Center 40% sharpened"
-                style={{
-                  maxWidth: "180px",
-                  borderRadius: "8px",
-                  border: "1px solid #ddd",
-                }}
-              />
-            </div>
-          )}
-        </div>
+            {/* Center base */}
+            {centerBase && (
+              <div>
+                <h4>Center 40% (raw)</h4>
+                <img
+                  src={centerBase}
+                  alt="Center 40% raw"
+                  style={{
+                    maxWidth: "180px",
+                    borderRadius: "8px",
+                    border: "1px solid #ddd",
+                  }}
+                />
+              </div>
+            )}
+
+            {/* Center sharpened (toggle) */}
+            {centerSharp && useCenterSharpen && (
+              <div>
+                <h4>Center 40% (sharpened)</h4>
+                <img
+                  src={centerSharp}
+                  alt="Center 40% sharpened"
+                  style={{
+                    maxWidth: "180px",
+                    borderRadius: "8px",
+                    border: "1px solid #ddd",
+                  }}
+                />
+              </div>
+            )}
+          </div>
+        </>
       )}
     </div>
   );
