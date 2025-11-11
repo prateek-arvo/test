@@ -3,8 +3,11 @@ import { BrowserQRCodeReader } from "@zxing/browser";
 
 function App() {
   const videoRef = useRef(null);
+  const videoTrackRef = useRef(null);
+
   const [result, setResult] = useState("");
   const [snapshot, setSnapshot] = useState(null);
+  const [focusSupported, setFocusSupported] = useState(false);
 
   useEffect(() => {
     const codeReader = new BrowserQRCodeReader();
@@ -23,60 +26,87 @@ function App() {
         });
 
         currentStream = stream;
+        const track = stream.getVideoTracks()[0];
+        videoTrackRef.current = track;
+
+        // Detect focus capabilities (Android Chrome usually yes, iOS Safari: maybe/limited)
+        try {
+          const caps = track.getCapabilities ? track.getCapabilities() : {};
+          const hasPOI = !!caps.pointsOfInterest;
+          const hasFocusMode =
+            Array.isArray(caps.focusMode) && caps.focusMode.length > 0;
+          setFocusSupported(hasPOI || hasFocusMode);
+        } catch {
+          setFocusSupported(false);
+        }
 
         if (!videoRef.current) return;
+
         videoRef.current.srcObject = stream;
         videoRef.current.setAttribute("playsinline", true);
         await videoRef.current.play();
 
-        // Start continuous decoding from this video element
+        // Continuous decode until first QR
         controls = await codeReader.decodeFromVideoDevice(
           undefined,
           videoRef.current,
           (res, err) => {
-            console.log(res)
-            if (locked) return;
-            if (res) {
-              locked = true;
-              setResult(res.getText());
+            if (locked || !res) return;
 
-              // Try to crop around QR using detected points
-              const pts = res.getResultPoints?.() || res.resultPoints || [];
+            locked = true;
+            const text = res.getText ? res.getText() : res.text;
+            setResult(text);
 
-              if (pts.length >= 3 && videoRef.current) {
-                const v = videoRef.current;
-                const canvas = document.createElement("canvas");
-                const ctx = canvas.getContext("2d");
-                canvas.width = v.videoWidth;
-                canvas.height = v.videoHeight;
-                ctx.drawImage(v, 0, 0, canvas.width, canvas.height);
+            const pts =
+              (res.getResultPoints && res.getResultPoints()) ||
+              res.resultPoints ||
+              [];
 
-                const xs = pts.map((p) => (p.getX ? p.getX() : p.x));
-                const ys = pts.map((p) => (p.getY ? p.getY() : p.y));
+            if (pts.length >= 3 && videoRef.current) {
+              const v = videoRef.current;
 
-                let x = Math.min(...xs);
-                let y = Math.min(...ys);
-                let w = Math.max(...xs) - x;
-                let h = Math.max(...ys) - y;
+              const canvas = document.createElement("canvas");
+              const ctx = canvas.getContext("2d");
+              canvas.width = v.videoWidth;
+              canvas.height = v.videoHeight;
+              ctx.drawImage(v, 0, 0, canvas.width, canvas.height);
 
-                const padding = 0.25 * Math.max(w, h);
-                x = Math.max(0, x - padding);
-                y = Math.max(0, y - padding);
-                w = Math.min(canvas.width - x, w + padding * 2);
-                h = Math.min(canvas.height - y, h + padding * 2);
+              const xs = pts.map((p) => (p.getX ? p.getX() : p.x));
+              const ys = pts.map((p) => (p.getY ? p.getY() : p.y));
 
-                const crop = document.createElement("canvas");
-                const cropCtx = crop.getContext("2d");
-                crop.width = w;
-                crop.height = h;
-                cropCtx.drawImage(canvas, x, y, w, h, 0, 0, w, h);
-                setSnapshot(crop.toDataURL("image/png"));
-              }
+              let x = Math.min(...xs);
+              let y = Math.min(...ys);
+              let w = Math.max(...xs) - x;
+              let h = Math.max(...ys) - y;
 
-              // Stop scanning & camera
-              if (controls) controls.stop();
-              if (currentStream)
-                currentStream.getTracks().forEach((t) => t.stop());
+              const padding = 0.25 * Math.max(w, h);
+              x = Math.max(0, x - padding);
+              y = Math.max(0, y - padding);
+              w = Math.min(canvas.width - x, w + padding * 2);
+              h = Math.min(canvas.height - y, h + padding * 2);
+
+              const crop = document.createElement("canvas");
+              const cropCtx = crop.getContext("2d");
+              crop.width = w;
+              crop.height = h;
+              cropCtx.drawImage(canvas, x, y, w, h, 0, 0, w, h);
+
+              setSnapshot(crop.toDataURL("image/png"));
+            } else if (videoRef.current) {
+              // fallback: full frame
+              const v = videoRef.current;
+              const canvas = document.createElement("canvas");
+              const ctx = canvas.getContext("2d");
+              canvas.width = v.videoWidth;
+              canvas.height = v.videoHeight;
+              ctx.drawImage(v, 0, 0, canvas.width, canvas.height);
+              setSnapshot(canvas.toDataURL("image/png"));
+            }
+
+            // Stop scanning & camera
+            if (controls) controls.stop();
+            if (currentStream) {
+              currentStream.getTracks().forEach((t) => t.stop());
             }
           }
         );
@@ -87,26 +117,90 @@ function App() {
 
     startCameraAndScan();
 
-    // Cleanup on unmount
     return () => {
       if (controls) controls.stop();
-      if (currentStream)
+      if (currentStream) {
         currentStream.getTracks().forEach((t) => t.stop());
+      }
     };
   }, []);
+
+  // Tap-to-focus (best-effort, no crash if unsupported)
+  const handleTapToFocus = async (e) => {
+    const video = videoRef.current;
+    const track = videoTrackRef.current;
+    if (!video || !track || !track.getCapabilities || !track.applyConstraints) {
+      return;
+    }
+
+    const caps = track.getCapabilities();
+    const rect = video.getBoundingClientRect();
+
+    // Normalized [0,1] coords inside video
+    const x = (e.clientX - rect.left) / rect.width;
+    const y = (e.clientY - rect.top) / rect.height;
+
+    const advanced = [];
+
+    if (caps.pointsOfInterest) {
+      advanced.push({
+        pointsOfInterest: [{ x, y }],
+      });
+    }
+
+    if (Array.isArray(caps.focusMode)) {
+      const mode =
+        (caps.focusMode.includes("single-shot") && "single-shot") ||
+        (caps.focusMode.includes("continuous") && "continuous") ||
+        null;
+      if (mode) {
+        advanced.push({ focusMode: mode });
+      }
+    }
+
+    if (!advanced.length) return;
+
+    try {
+      await track.applyConstraints({ advanced });
+    } catch (err) {
+      console.warn("Tap-to-focus failed/ignored:", err);
+    }
+  };
 
   return (
     <div style={{ textAlign: "center", padding: "20px" }}>
       <h2>QR Test App</h2>
-      <video
-        ref={videoRef}
-        style={{
-          width: "100%",
-          maxWidth: "500px",
-          border: "1px solid #ccc",
-          borderRadius: "8px",
-        }}
-      />
+
+      <div style={{ position: "relative", display: "inline-block" }}>
+        <video
+          ref={videoRef}
+          onClick={handleTapToFocus}
+          style={{
+            width: "100%",
+            maxWidth: "500px",
+            border: "1px solid #ccc",
+            borderRadius: "8px",
+            cursor: focusSupported ? "crosshair" : "default",
+          }}
+        />
+        {focusSupported && (
+          <div
+            style={{
+              position: "absolute",
+              bottom: 8,
+              right: 8,
+              padding: "3px 6px",
+              fontSize: "10px",
+              background: "rgba(0,0,0,0.55)",
+              color: "#fff",
+              borderRadius: "4px",
+            }}
+          >
+            Tap to focus
+          </div>
+        )}
+      </div>
+
       {result && (
         <div style={{ marginTop: "16px" }}>
           <h3>QR Content</h3>
@@ -124,6 +218,7 @@ function App() {
           </p>
         </div>
       )}
+
       {snapshot && (
         <div style={{ marginTop: "16px" }}>
           <h3>Cropped QR</h3>
