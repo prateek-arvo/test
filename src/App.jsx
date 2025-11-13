@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from "react";
 
 /** --- Tunables --- */
-const OPENCV_SRC = "https://docs.opencv.org/4.x/opencv.js"; // host locally if you prefer
+const OPENCV_SRC = "https://cdn.jsdelivr.net/npm/opencv.js@4.10.0/opencv.js";
 const BOX_FRACTION = 0.5;      // fraction of min(videoWidth, videoHeight) for square aim box
 const CENTER_FRACTION = 0.4;   // center patch from QR crop
 const STABILITY_FRAMES = 4;    // frames that must agree before cropping
