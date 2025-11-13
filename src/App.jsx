@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from "react";
 
 /** --- Tunables --- */
-const OPENCV_SRC = "https://docs.opencv.org/4.x/opencv.js"; // change if hosting locally
+const OPENCV_SRC = "https://docs.opencv.org/4.x/opencv.js"; // host locally if you prefer
 const BOX_FRACTION = 0.5;      // fraction of min(videoWidth, videoHeight) for square aim box
 const CENTER_FRACTION = 0.4;   // center patch from QR crop
 const STABILITY_FRAMES = 4;    // frames that must agree before cropping
@@ -9,67 +9,65 @@ const POSITION_TOL_PX = 8;     // allowed movement of QR center between frames
 const SIZE_TOL_RATIO = 0.18;   // allowed size change between frames
 const PADDING_RATIO = 0.05;    // small padding around QR (set 0 for none)
 
-/** Utility: load OpenCV.js once */
+/** Utility: lazy-load OpenCV.js */
 function useOpenCV(src = OPENCV_SRC) {
-  const [ready, setReady] = useState(false);
+  const [ready, setReady] = useState(!!(window.cv && window.cv.Mat));
+  const [error, setError] = useState("");
 
   useEffect(() => {
-    if (window.cv && window.cv.Mat) {
-      setReady(true);
-      return;
-    }
-    const script = document.createElement("script");
+    if (ready) return;
+
+    let script = document.createElement("script");
     script.src = src;
     script.async = true;
+    script.crossOrigin = "anonymous";
     script.onload = () => {
-      const check = () => {
-        // Some builds expose cv['onRuntimeInitialized'], others set cv.ready
-        if (window.cv && (window.cv.Mat || window.cv['onRuntimeInitialized'] === undefined)) {
-          if (window.cv && window.cv['onRuntimeInitialized']) {
-            window.cv['onRuntimeInitialized'] = () => setReady(true);
-          } else {
-            // If the build is already ready
-            setReady(true);
-          }
+      try {
+        if (window.cv && window.cv['onRuntimeInitialized'] !== undefined) {
+          window.cv['onRuntimeInitialized'] = () => setReady(true);
+        } else if (window.cv && window.cv.Mat) {
+          setReady(true);
         } else {
-          // Fallback polling (rare)
+          // Poll (some builds take a tick)
           const id = setInterval(() => {
             if (window.cv && window.cv.Mat) {
               clearInterval(id);
               setReady(true);
             }
           }, 50);
+          setTimeout(() => clearInterval(id), 5000);
         }
-      };
-      check();
+      } catch (e) {
+        setError("OpenCV loaded but failed to initialize.");
+      }
     };
-    script.onerror = () => {
-      console.error("Failed to load OpenCV.js");
-    };
+    script.onerror = () => setError("Failed to load OpenCV.js (network/CORS).");
     document.head.appendChild(script);
-    return () => {
-      document.head.removeChild(script);
-    };
-  }, [src]);
 
-  return ready;
+    return () => {
+      // Do not remove the script on unmount during hot reloads; safer to leave it.
+    };
+  }, [ready, src]);
+
+  return { cvReady: ready, cvError: error };
 }
 
-function App() {
-  const cvReady = useOpenCV();
+export default function App() {
+  const { cvReady, cvError } = useOpenCV();
 
   const videoRef = useRef(null);
   const videoTrackRef = useRef(null);
-  const workCanvasRef = useRef(null); // offscreen canvas for OpenCV read
-  const qrBoxHistoryRef = useRef([]); // recent QR boxes for stability
+  const workCanvasRef = useRef(null);
+  const qrBoxHistoryRef = useRef([]);
   const rafRef = useRef(0);
   const lockedRef = useRef(false);
 
-  const [result, setResult] = useState("");
+  const [camReady, setCamReady] = useState(false);
+  const [errors, setErrors] = useState([]);
 
+  const [result, setResult] = useState("");
   const [qrBase, setQrBase] = useState(null);
   const [centerBase, setCenterBase] = useState(null);
-
   const [qrProcessed, setQrProcessed] = useState(null);
   const [centerProcessed, setCenterProcessed] = useState(null);
 
@@ -81,105 +79,135 @@ function App() {
   const [contrast, setContrast] = useState(1.0);       // 0.5–2
   const [brightness, setBrightness] = useState(0.0);   // -0.3–0.3
 
-  // Start camera + detection when OpenCV is ready
-  useEffect(() => {
-    if (!cvReady) return;
+  // Start camera on button click (user gesture helps autoplay policies)
+  const handleStartCamera = async () => {
+    try {
+      if (!navigator.mediaDevices?.getUserMedia) {
+        throw new Error("getUserMedia not supported in this browser.");
+      }
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: false,
+        video: {
+          facingMode: { ideal: "environment" },
+          width: { ideal: 2560 },
+          height: { ideal: 1440 },
+        },
+      });
+      const [track] = stream.getVideoTracks();
+      videoTrackRef.current = track;
 
-    let currentStream = null;
-
-    const start = async () => {
+      // Torch support (Android Chrome)
       try {
-        const stream = await navigator.mediaDevices.getUserMedia({
-          video: {
-            facingMode: "environment",
-            width: { ideal: 2560 },
-            height: { ideal: 1440 },
-          },
-        });
-        currentStream = stream;
-        const [track] = stream.getVideoTracks();
-        videoTrackRef.current = track;
+        const caps = track.getCapabilities?.();
+        setTorchSupported(!!(caps && "torch" in caps));
+      } catch {
+        setTorchSupported(false);
+      }
 
-        // Torch support (Android Chrome)
-        try {
-          const caps = track.getCapabilities?.();
-          if (caps && "torch" in caps) setTorchSupported(true);
-        } catch {
-          setTorchSupported(false);
-        }
+      if (!videoRef.current) return;
+      videoRef.current.srcObject = stream;
+      // Mobile quirks: muted + playsInline helps autoplay
+      videoRef.current.muted = true;
+      videoRef.current.setAttribute("playsinline", "true");
 
-        if (!videoRef.current) return;
-        videoRef.current.srcObject = stream;
-        videoRef.current.setAttribute("playsinline", true);
+      try {
         await videoRef.current.play();
-
-        // Prepare offscreen canvas
-        if (!workCanvasRef.current) {
-          workCanvasRef.current = document.createElement("canvas");
-        }
-
-        lockedRef.current = false;
-        qrBoxHistoryRef.current = [];
-        loopDetect(); // kick off RAF loop
       } catch (e) {
-        console.error("Camera error:", e);
+        // Some browsers still need another tap; show user-friendly hint
+        pushError("Tap the video to start playback (autoplay blocked).");
+        videoRef.current.addEventListener(
+          "click",
+          async () => {
+            try {
+              await videoRef.current.play();
+            } catch (err) {
+              pushError("Video playback blocked by browser policy.");
+            }
+          },
+          { once: true }
+        );
       }
-    };
 
-    const stop = () => {
+      setCamReady(true);
+      // If OpenCV is already ready, kick off detection
+      if (cvReady) startDetectionLoop();
+    } catch (e) {
+      pushError(describeCamError(e));
+    }
+  };
+
+  // If OpenCV becomes ready after camera, start detection
+  useEffect(() => {
+    if (cvReady && camReady) startDetectionLoop();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cvReady, camReady]);
+
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => {
       cancelAnimationFrame(rafRef.current || 0);
-      if (currentStream) {
-        currentStream.getTracks().forEach((t) => t.stop());
-      }
-      videoTrackRef.current = null;
-      setTorchOn(false);
+      stopCamera();
     };
+  }, []);
 
-    const loopDetect = () => {
-      rafRef.current = requestAnimationFrame(loopDetect);
+  function stopCamera() {
+    const stream = videoRef.current?.srcObject;
+    if (stream && stream.getTracks) {
+      stream.getTracks().forEach((t) => t.stop());
+    }
+    videoTrackRef.current = null;
+    setTorchOn(false);
+  }
+
+  function startDetectionLoop() {
+    if (!workCanvasRef.current) {
+      workCanvasRef.current = document.createElement("canvas");
+    }
+    lockedRef.current = false;
+    qrBoxHistoryRef.current = [];
+
+    const loop = () => {
+      rafRef.current = requestAnimationFrame(loop);
+      if (lockedRef.current) return;
       const v = videoRef.current;
       if (!v || !v.videoWidth || !v.videoHeight) return;
-      if (lockedRef.current) return;
 
       const vw = v.videoWidth;
       const vh = v.videoHeight;
 
-      // Compute square aim box (video coords)
+      // Square aim box in video coords
       const boxSize = Math.floor(Math.min(vw, vh) * BOX_FRACTION);
       const boxX = Math.floor((vw - boxSize) / 2);
       const boxY = Math.floor((vh - boxSize) / 2);
       const boxX2 = boxX + boxSize;
       const boxY2 = boxY + boxSize;
 
-      // Draw current frame to offscreen canvas
+      // Draw to offscreen canvas
       const canvas = workCanvasRef.current;
       canvas.width = vw;
       canvas.height = vh;
       const ctx = canvas.getContext("2d");
       ctx.drawImage(v, 0, 0, vw, vh);
 
-      // OpenCV: read and detect
+      // OpenCV detect
       const cv = window.cv;
+      if (!cv || !cv.Mat) return; // not ready yet
       let src = null;
       let points = new cv.Mat();
       try {
-        src = cv.imread(canvas); // RGBA Mat
+        src = cv.imread(canvas); // RGBA
         const detector = new cv.QRCodeDetector();
-
-        // detectAndDecode returns string; points is Nx2 float array (4x1x2 or 1x4x2 depending on version)
         const decoded = detector.detectAndDecode(src, points);
         detector.delete();
 
         if (!decoded || decoded.length === 0) {
-          // no QR this frame
           qrBoxHistoryRef.current = [];
           src.delete();
           points.delete();
           return;
         }
 
-        // Extract 4 corner points
-        const pts = matToPoints(points); // [{x, y} x4] in image coordinates
+        const pts = matToPoints(points);
         if (!pts || pts.length < 4) {
           qrBoxHistoryRef.current = [];
           src.delete();
@@ -193,10 +221,10 @@ function App() {
         let maxX = Math.max(...xs);
         let minY = Math.min(...ys);
         let maxY = Math.max(...ys);
-        let qrW = maxX - minX;
-        let qrH = maxY - minY;
+        const qrW = maxX - minX;
+        const qrH = maxY - minY;
 
-        // Require QR fully inside aim box
+        // Require fully inside aim box
         if (minX < boxX || minY < boxY || maxX > boxX2 || maxY > boxY2) {
           qrBoxHistoryRef.current = [];
           src.delete();
@@ -204,7 +232,7 @@ function App() {
           return;
         }
 
-        // Tight crop with small padding (optional)
+        // Tight crop + optional padding
         const pad = PADDING_RATIO * Math.max(qrW, qrH);
         const cropX = Math.max(0, Math.floor(minX - pad));
         const cropY = Math.max(0, Math.floor(minY - pad));
@@ -214,56 +242,40 @@ function App() {
         pushQrBox({ x: cropX, y: cropY, w: cropW, h: cropH });
 
         if (isStable()) {
-          // Lock & capture
           lockedRef.current = true;
           setResult(decoded);
           const stable = getAverageBox();
-          if (stable) {
-            captureQrRegion(v, stable);
-          }
-          // Stop stream (end of flow)
+          if (stable) captureQrRegion(v, stable);
+          stopCamera();
           cancelAnimationFrame(rafRef.current || 0);
-          if (videoRef.current?.srcObject) {
-            (videoRef.current.srcObject.getTracks?.() || []).forEach((t) => t.stop());
-          }
-          videoTrackRef.current = null;
-          setTorchOn(false);
           qrBoxHistoryRef.current = [];
         }
 
         src.delete();
         points.delete();
       } catch (err) {
-        console.error("OpenCV detect error:", err);
+        pushError("OpenCV detect error: " + (err?.message || String(err)));
         if (src) src.delete();
         points.delete();
       }
     };
 
-    start();
-    return () => {
-      cancelAnimationFrame(rafRef.current || 0);
-      if (videoRef.current?.srcObject) {
-        (videoRef.current.srcObject.getTracks?.() || []).forEach((t) => t.stop());
-      }
-      videoTrackRef.current = null;
-      setTorchOn(false);
-      qrBoxHistoryRef.current = [];
-    };
-  }, [cvReady]);
+    cancelAnimationFrame(rafRef.current || 0);
+    loop();
+  }
 
   /** Torch toggle */
   const handleToggleTorch = async () => {
     const track = videoTrackRef.current;
-    if (!track || !track.getCapabilities || !track.applyConstraints) return;
+    if (!track?.getCapabilities || !track?.applyConstraints) return;
     try {
       const caps = track.getCapabilities();
-      if (!caps || !caps.torch) return;
+      if (!caps?.torch) return;
       const newValue = !torchOn;
       await track.applyConstraints({ advanced: [{ torch: newValue }] });
       setTorchOn(newValue);
     } catch (err) {
-      console.warn("Torch toggle failed or unsupported:", err);
+      pushError("Torch toggle failed or unsupported.");
     }
   };
 
@@ -450,41 +462,42 @@ function App() {
 
   // Convert OpenCV points Mat (4 points) to array of {x,y}
   function matToPoints(pointsMat) {
-    // pointsMat can be (1 x 4 x 2) or (4 x 1 x 2) or 4x2. Handle generically.
     const pts = [];
-    const rows = pointsMat.rows;
-    const cols = pointsMat.cols;
-    const type = pointsMat.type();
-
-    // Expect CV_32FC2 or similar
-    if (rows === 4 && cols === 1) {
+    // Try common layouts
+    if (pointsMat.rows === 4 && pointsMat.cols === 1 && pointsMat.data32F) {
       for (let i = 0; i < 4; i++) {
         const x = pointsMat.data32F[i * 2];
         const y = pointsMat.data32F[i * 2 + 1];
         pts.push({ x, y });
       }
-    } else if (rows === 1 && cols === 4) {
+    } else if (pointsMat.rows === 1 && pointsMat.cols === 4 && pointsMat.data32F) {
       for (let i = 0; i < 4; i++) {
         const x = pointsMat.data32F[i * 2];
         const y = pointsMat.data32F[i * 2 + 1];
         pts.push({ x, y });
       }
-    } else if (rows === 4 && cols === 2 && (type & 7) === window.cv.CV_32F) {
+    } else if (pointsMat.rows === 4 && pointsMat.cols === 2 && pointsMat.type() === window.cv.CV_32F) {
       for (let i = 0; i < 4; i++) {
         const x = pointsMat.floatAt(i, 0);
         const y = pointsMat.floatAt(i, 1);
         pts.push({ x, y });
       }
-    } else {
-      // Fallback: try to read as float array
-      const data = pointsMat.data32F || pointsMat.data64F;
-      if (data && data.length >= 8) {
-        for (let i = 0; i < 4; i++) {
-          pts.push({ x: data[i * 2], y: data[i * 2 + 1] });
-        }
-      }
     }
     return pts;
+  }
+
+  function pushError(msg) {
+    setErrors((prev) => [...prev, msg]);
+    console.error(msg);
+  }
+
+  function describeCamError(e) {
+    const msg = e?.message || String(e);
+    if (msg.includes("NotAllowedError")) return "Camera access denied. Check site permissions.";
+    if (msg.includes("NotFoundError")) return "No camera found. Is a camera available?";
+    if (msg.includes("NotReadableError")) return "Camera is busy or in use by another app.";
+    if (msg.includes("OverconstrainedError")) return "Requested camera constraints not supported.";
+    return "Camera error: " + msg;
   }
 
   const captured = qrBase && centerBase;
@@ -493,9 +506,26 @@ function App() {
     <div style={{ textAlign: "center", padding: "20px" }}>
       <h2>QR → CDP Extractor (OpenCV.js, Box-Aimed, QR-Only Stable Crop)</h2>
 
+      {!camReady && (
+        <button
+          onClick={handleStartCamera}
+          style={{
+            padding: "10px 16px",
+            borderRadius: 8,
+            border: "1px solid #ccc",
+            background: "#111",
+            color: "#fff",
+            cursor: "pointer",
+            marginBottom: 10,
+          }}
+        >
+          Start Scanner
+        </button>
+      )}
+
       {!cvReady && (
         <div style={{ marginBottom: 10, color: "#666" }}>
-          Loading OpenCV.js…
+          Loading OpenCV.js… {cvError && <span style={{ color: "crimson" }}>{cvError}</span>}
         </div>
       )}
 
@@ -527,7 +557,7 @@ function App() {
             pointerEvents: "none",
           }}
         />
-        {torchSupported && (
+        {torchSupported && camReady && (
           <button
             onClick={handleToggleTorch}
             style={{
@@ -548,6 +578,15 @@ function App() {
           </button>
         )}
       </div>
+
+      {errors.length > 0 && (
+        <div style={{ marginTop: 12, color: "crimson", textAlign: "left", maxWidth: 520, marginInline: "auto" }}>
+          <b>Issues:</b>
+          <ul>
+            {errors.map((e, i) => <li key={i}>{e}</li>)}
+          </ul>
+        </div>
+      )}
 
       {result && (
         <div style={{ marginTop: "16px" }}>
@@ -687,5 +726,3 @@ function App() {
     </div>
   );
 }
-
-export default App;
