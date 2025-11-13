@@ -1,19 +1,69 @@
 import React, { useEffect, useRef, useState } from "react";
-import { BrowserQRCodeReader } from "@zxing/browser";
 
-const BOX_FRACTION = 0.5;       // fraction of min(videoWidth, videoHeight) for the square aim box
-const CENTER_FRACTION = 0.4;    // center patch from QR crop
+/** --- Tunables --- */
+const OPENCV_SRC = "https://docs.opencv.org/4.x/opencv.js"; // change if hosting locally
+const BOX_FRACTION = 0.5;      // fraction of min(videoWidth, videoHeight) for square aim box
+const CENTER_FRACTION = 0.4;   // center patch from QR crop
+const STABILITY_FRAMES = 4;    // frames that must agree before cropping
+const POSITION_TOL_PX = 8;     // allowed movement of QR center between frames
+const SIZE_TOL_RATIO = 0.18;   // allowed size change between frames
+const PADDING_RATIO = 0.05;    // small padding around QR (set 0 for none)
 
-// Auto-crop / stability controls
-const STABILITY_FRAMES = 2;     // how many recent frames must agree
-const POSITION_TOL_PX = 8;      // allowed movement of QR center
-const SIZE_TOL_RATIO = 0.18;    // allowed size change
-const PADDING_RATIO = 0.05;     // small padding around QR; set 0 for zero extra
+/** Utility: load OpenCV.js once */
+function useOpenCV(src = OPENCV_SRC) {
+  const [ready, setReady] = useState(false);
+
+  useEffect(() => {
+    if (window.cv && window.cv.Mat) {
+      setReady(true);
+      return;
+    }
+    const script = document.createElement("script");
+    script.src = src;
+    script.async = true;
+    script.onload = () => {
+      const check = () => {
+        // Some builds expose cv['onRuntimeInitialized'], others set cv.ready
+        if (window.cv && (window.cv.Mat || window.cv['onRuntimeInitialized'] === undefined)) {
+          if (window.cv && window.cv['onRuntimeInitialized']) {
+            window.cv['onRuntimeInitialized'] = () => setReady(true);
+          } else {
+            // If the build is already ready
+            setReady(true);
+          }
+        } else {
+          // Fallback polling (rare)
+          const id = setInterval(() => {
+            if (window.cv && window.cv.Mat) {
+              clearInterval(id);
+              setReady(true);
+            }
+          }, 50);
+        }
+      };
+      check();
+    };
+    script.onerror = () => {
+      console.error("Failed to load OpenCV.js");
+    };
+    document.head.appendChild(script);
+    return () => {
+      document.head.removeChild(script);
+    };
+  }, [src]);
+
+  return ready;
+}
 
 function App() {
+  const cvReady = useOpenCV();
+
   const videoRef = useRef(null);
   const videoTrackRef = useRef(null);
+  const workCanvasRef = useRef(null); // offscreen canvas for OpenCV read
   const qrBoxHistoryRef = useRef([]); // recent QR boxes for stability
+  const rafRef = useRef(0);
+  const lockedRef = useRef(false);
 
   const [result, setResult] = useState("");
 
@@ -31,15 +81,13 @@ function App() {
   const [contrast, setContrast] = useState(1.0);       // 0.5–2
   const [brightness, setBrightness] = useState(0.0);   // -0.3–0.3
 
+  // Start camera + detection when OpenCV is ready
   useEffect(() => {
-    const codeReader = new BrowserQRCodeReader();
+    if (!cvReady) return;
+
     let currentStream = null;
-    let controls = null;
-    let locked = false;
 
-    qrBoxHistoryRef.current = [];
-
-    const startCameraAndScan = async () => {
+    const start = async () => {
       try {
         const stream = await navigator.mediaDevices.getUserMedia({
           video: {
@@ -48,7 +96,6 @@ function App() {
             height: { ideal: 1440 },
           },
         });
-
         currentStream = stream;
         const [track] = stream.getVideoTracks();
         videoTrackRef.current = track;
@@ -66,106 +113,146 @@ function App() {
         videoRef.current.setAttribute("playsinline", true);
         await videoRef.current.play();
 
-        controls = await codeReader.decodeFromVideoDevice(
-          undefined,
-          videoRef.current,
-          (res, err) => {
-            if (!res || locked || !videoRef.current) return;
+        // Prepare offscreen canvas
+        if (!workCanvasRef.current) {
+          workCanvasRef.current = document.createElement("canvas");
+        }
 
-            const v = videoRef.current;
-            const vw = v.videoWidth;
-            const vh = v.videoHeight;
-            if (!vw || !vh) return;
-
-            // --- Compute square bounding box in video coords ---
-            const boxSize = Math.floor(Math.min(vw, vh) * BOX_FRACTION);
-            const boxX = Math.floor((vw - boxSize) / 2);
-            const boxY = Math.floor((vh - boxSize) / 2);
-            const boxX2 = boxX + boxSize;
-            const boxY2 = boxY + boxSize;
-
-            // --- QR bounding box from resultPoints ---
-            const pts =
-              (res.getResultPoints && res.getResultPoints()) ||
-              res.resultPoints ||
-              [];
-
-            if (!pts || pts.length < 3) return;
-
-            const xs = pts.map((p) => (p.getX ? p.getX() : p.x));
-            const ys = pts.map((p) => (p.getY ? p.getY() : p.y));
-            let minX = Math.min(...xs);
-            let maxX = Math.max(...xs);
-            let minY = Math.min(...ys);
-            let maxY = Math.max(...ys);
-
-            let qrW = maxX - minX;
-            let qrH = maxY - minY;
-
-            // Require QR to be fully inside the visible square bounding box
-            if (
-              minX < boxX ||
-              minY < boxY ||
-              maxX > boxX2 ||
-              maxY > boxY2
-            ) {
-              // Ignore detections outside / crossing the box
-              qrBoxHistoryRef.current = [];
-              return;
-            }
-
-            // Apply small padding only around QR (still within video bounds)
-            const pad = PADDING_RATIO * Math.max(qrW, qrH);
-            let cropX = Math.max(0, Math.floor(minX - pad));
-            let cropY = Math.max(0, Math.floor(minY - pad));
-            let cropW = Math.min(vw - cropX, Math.floor(qrW + pad * 2));
-            let cropH = Math.min(vh - cropY, Math.floor(qrH + pad * 2));
-
-            const qrBox = { x: cropX, y: cropY, w: cropW, h: cropH };
-            pushQrBox(qrBox);
-
-            // Only proceed once box has been stable over several frames
-            if (!isStable()) return;
-
-            locked = true;
-
-            const text = res.getText ? res.getText() : res.text;
-            setResult(text || "");
-
-            const stableBox = getAverageBox();
-            if (stableBox) {
-              captureQrRegion(v, stableBox);
-            }
-
-            // Stop scanning & camera after capture
-            if (controls) controls.stop();
-            if (currentStream) {
-              currentStream.getTracks().forEach((t) => t.stop());
-            }
-            videoTrackRef.current = null;
-            setTorchOn(false);
-            qrBoxHistoryRef.current = [];
-          }
-        );
+        lockedRef.current = false;
+        qrBoxHistoryRef.current = [];
+        loopDetect(); // kick off RAF loop
       } catch (e) {
-        console.error("Camera or decoding error:", e);
+        console.error("Camera error:", e);
       }
     };
 
-    startCameraAndScan();
-
-    return () => {
-      if (controls) controls.stop();
+    const stop = () => {
+      cancelAnimationFrame(rafRef.current || 0);
       if (currentStream) {
         currentStream.getTracks().forEach((t) => t.stop());
       }
       videoTrackRef.current = null;
       setTorchOn(false);
+    };
+
+    const loopDetect = () => {
+      rafRef.current = requestAnimationFrame(loopDetect);
+      const v = videoRef.current;
+      if (!v || !v.videoWidth || !v.videoHeight) return;
+      if (lockedRef.current) return;
+
+      const vw = v.videoWidth;
+      const vh = v.videoHeight;
+
+      // Compute square aim box (video coords)
+      const boxSize = Math.floor(Math.min(vw, vh) * BOX_FRACTION);
+      const boxX = Math.floor((vw - boxSize) / 2);
+      const boxY = Math.floor((vh - boxSize) / 2);
+      const boxX2 = boxX + boxSize;
+      const boxY2 = boxY + boxSize;
+
+      // Draw current frame to offscreen canvas
+      const canvas = workCanvasRef.current;
+      canvas.width = vw;
+      canvas.height = vh;
+      const ctx = canvas.getContext("2d");
+      ctx.drawImage(v, 0, 0, vw, vh);
+
+      // OpenCV: read and detect
+      const cv = window.cv;
+      let src = null;
+      let points = new cv.Mat();
+      try {
+        src = cv.imread(canvas); // RGBA Mat
+        const detector = new cv.QRCodeDetector();
+
+        // detectAndDecode returns string; points is Nx2 float array (4x1x2 or 1x4x2 depending on version)
+        const decoded = detector.detectAndDecode(src, points);
+        detector.delete();
+
+        if (!decoded || decoded.length === 0) {
+          // no QR this frame
+          qrBoxHistoryRef.current = [];
+          src.delete();
+          points.delete();
+          return;
+        }
+
+        // Extract 4 corner points
+        const pts = matToPoints(points); // [{x, y} x4] in image coordinates
+        if (!pts || pts.length < 4) {
+          qrBoxHistoryRef.current = [];
+          src.delete();
+          points.delete();
+          return;
+        }
+
+        const xs = pts.map((p) => p.x);
+        const ys = pts.map((p) => p.y);
+        let minX = Math.min(...xs);
+        let maxX = Math.max(...xs);
+        let minY = Math.min(...ys);
+        let maxY = Math.max(...ys);
+        let qrW = maxX - minX;
+        let qrH = maxY - minY;
+
+        // Require QR fully inside aim box
+        if (minX < boxX || minY < boxY || maxX > boxX2 || maxY > boxY2) {
+          qrBoxHistoryRef.current = [];
+          src.delete();
+          points.delete();
+          return;
+        }
+
+        // Tight crop with small padding (optional)
+        const pad = PADDING_RATIO * Math.max(qrW, qrH);
+        const cropX = Math.max(0, Math.floor(minX - pad));
+        const cropY = Math.max(0, Math.floor(minY - pad));
+        const cropW = Math.min(vw - cropX, Math.floor(qrW + pad * 2));
+        const cropH = Math.min(vh - cropY, Math.floor(qrH + pad * 2));
+
+        pushQrBox({ x: cropX, y: cropY, w: cropW, h: cropH });
+
+        if (isStable()) {
+          // Lock & capture
+          lockedRef.current = true;
+          setResult(decoded);
+          const stable = getAverageBox();
+          if (stable) {
+            captureQrRegion(v, stable);
+          }
+          // Stop stream (end of flow)
+          cancelAnimationFrame(rafRef.current || 0);
+          if (videoRef.current?.srcObject) {
+            (videoRef.current.srcObject.getTracks?.() || []).forEach((t) => t.stop());
+          }
+          videoTrackRef.current = null;
+          setTorchOn(false);
+          qrBoxHistoryRef.current = [];
+        }
+
+        src.delete();
+        points.delete();
+      } catch (err) {
+        console.error("OpenCV detect error:", err);
+        if (src) src.delete();
+        points.delete();
+      }
+    };
+
+    start();
+    return () => {
+      cancelAnimationFrame(rafRef.current || 0);
+      if (videoRef.current?.srcObject) {
+        (videoRef.current.srcObject.getTracks?.() || []).forEach((t) => t.stop());
+      }
+      videoTrackRef.current = null;
+      setTorchOn(false);
       qrBoxHistoryRef.current = [];
     };
-  }, []);
+  }, [cvReady]);
 
-  // Torch toggle
+  /** Torch toggle */
   const handleToggleTorch = async () => {
     const track = videoTrackRef.current;
     if (!track || !track.getCapabilities || !track.applyConstraints) return;
@@ -180,8 +267,7 @@ function App() {
     }
   };
 
-  // --- Stability helpers (for slow/robust auto-crop) ---
-
+  /** ---- Stability helpers ---- */
   function pushQrBox(box) {
     const hist = qrBoxHistoryRef.current;
     hist.push(box);
@@ -191,15 +277,9 @@ function App() {
   function getAverageBox() {
     const hist = qrBoxHistoryRef.current;
     if (!hist.length) return null;
-    let sx = 0,
-      sy = 0,
-      sw = 0,
-      sh = 0;
+    let sx = 0, sy = 0, sw = 0, sh = 0;
     for (const b of hist) {
-      sx += b.x;
-      sy += b.y;
-      sw += b.w;
-      sh += b.h;
+      sx += b.x; sy += b.y; sw += b.w; sh += b.h;
     }
     const n = hist.length;
     return {
@@ -213,7 +293,6 @@ function App() {
   function isStable() {
     const hist = qrBoxHistoryRef.current;
     if (hist.length < STABILITY_FRAMES) return false;
-
     const avg = getAverageBox();
     if (!avg) return false;
 
@@ -225,8 +304,8 @@ function App() {
 
       const centerDx = Math.abs(cx - cax);
       const centerDy = Math.abs(cy - cay);
-      const sizeDrW = Math.abs(b.w - avg.w) / avg.w;
-      const sizeDrH = Math.abs(b.h - avg.h) / avg.h;
+      const sizeDrW = Math.abs(b.w - avg.w) / Math.max(1, avg.w);
+      const sizeDrH = Math.abs(b.h - avg.h) / Math.max(1, avg.h);
 
       if (
         centerDx > POSITION_TOL_PX ||
@@ -237,25 +316,23 @@ function App() {
         return false;
       }
     }
-
     return true;
   }
 
-  // --- Capture: tight QR-only crop based on stable box ---
-
+  /** ---- Capture and post-crop helpers ---- */
   function captureQrRegion(video, box) {
     const { x, y, w, h } = box;
 
+    // Tight QR crop
     const qrCanvas = document.createElement("canvas");
     qrCanvas.width = w;
     qrCanvas.height = h;
     const qrCtx = qrCanvas.getContext("2d");
     qrCtx.drawImage(video, x, y, w, h, 0, 0, w, h);
-
     const qrUrl = qrCanvas.toDataURL("image/png");
     setQrBase(qrUrl);
 
-    // Center 40% from within qr-only crop
+    // Center 40% from within the QR crop
     const baseSize = Math.min(w, h);
     const patchSize = Math.floor(baseSize * CENTER_FRACTION);
     const cx = Math.floor(w / 2);
@@ -274,21 +351,14 @@ function App() {
     const centerCtx = centerCanvas.getContext("2d");
     centerCtx.drawImage(
       qrCanvas,
-      px,
-      py,
-      patchSize,
-      patchSize,
-      0,
-      0,
-      patchSize,
-      patchSize
+      px, py, patchSize, patchSize,
+      0, 0, patchSize, patchSize
     );
     const centerUrl = centerCanvas.toDataURL("image/png");
     setCenterBase(centerUrl);
   }
 
-  // --- Post-capture processing ---
-
+  // Recompute processed previews whenever sliders or base images change
   useEffect(() => {
     if (!qrBase) return;
     processImage(qrBase, sharpAmount, contrast, brightness, setQrProcessed);
@@ -319,6 +389,7 @@ function App() {
     };
   }
 
+  // Brightness [-0.5,0.5], Contrast [0.5,2]
   function applyBrightnessContrast(imageData, contrastVal, brightnessVal) {
     const { data } = imageData;
     for (let i = 0; i < data.length; i += 4) {
@@ -333,13 +404,14 @@ function App() {
     return imageData;
   }
 
+  // Simple unsharp mask
   function applyUnsharp(imageData, amount = 0.3) {
     const { width, height, data } = imageData;
     const len = data.length;
     const blur = new Uint8ClampedArray(len);
     const w4 = width * 4;
 
-    // simple 3x3 box blur
+    // 3x3 box blur
     for (let y = 1; y < height - 1; y++) {
       for (let x = 1; x < width - 1; x++) {
         const idx = (y * width + x) * 4;
@@ -376,11 +448,56 @@ function App() {
     return new ImageData(out, width, height);
   }
 
+  // Convert OpenCV points Mat (4 points) to array of {x,y}
+  function matToPoints(pointsMat) {
+    // pointsMat can be (1 x 4 x 2) or (4 x 1 x 2) or 4x2. Handle generically.
+    const pts = [];
+    const rows = pointsMat.rows;
+    const cols = pointsMat.cols;
+    const type = pointsMat.type();
+
+    // Expect CV_32FC2 or similar
+    if (rows === 4 && cols === 1) {
+      for (let i = 0; i < 4; i++) {
+        const x = pointsMat.data32F[i * 2];
+        const y = pointsMat.data32F[i * 2 + 1];
+        pts.push({ x, y });
+      }
+    } else if (rows === 1 && cols === 4) {
+      for (let i = 0; i < 4; i++) {
+        const x = pointsMat.data32F[i * 2];
+        const y = pointsMat.data32F[i * 2 + 1];
+        pts.push({ x, y });
+      }
+    } else if (rows === 4 && cols === 2 && (type & 7) === window.cv.CV_32F) {
+      for (let i = 0; i < 4; i++) {
+        const x = pointsMat.floatAt(i, 0);
+        const y = pointsMat.floatAt(i, 1);
+        pts.push({ x, y });
+      }
+    } else {
+      // Fallback: try to read as float array
+      const data = pointsMat.data32F || pointsMat.data64F;
+      if (data && data.length >= 8) {
+        for (let i = 0; i < 4; i++) {
+          pts.push({ x: data[i * 2], y: data[i * 2 + 1] });
+        }
+      }
+    }
+    return pts;
+  }
+
   const captured = qrBase && centerBase;
 
   return (
     <div style={{ textAlign: "center", padding: "20px" }}>
-      <h2>QR → CDP Extractor (Box-Aimed, QR-Only Stable Crop)</h2>
+      <h2>QR → CDP Extractor (OpenCV.js, Box-Aimed, QR-Only Stable Crop)</h2>
+
+      {!cvReady && (
+        <div style={{ marginBottom: 10, color: "#666" }}>
+          Loading OpenCV.js…
+        </div>
+      )}
 
       <div style={{ position: "relative", display: "inline-block" }}>
         <video
@@ -390,7 +507,10 @@ function App() {
             maxWidth: "500px",
             border: "1px solid #ccc",
             borderRadius: "8px",
+            background: "#000",
           }}
+          muted
+          playsInline
         />
         {/* Square bounding box overlay (aim region) */}
         <div
@@ -467,9 +587,7 @@ function App() {
                 max="1"
                 step="0.05"
                 value={sharpAmount}
-                onChange={(e) =>
-                  setSharpAmount(parseFloat(e.target.value))
-                }
+                onChange={(e) => setSharpAmount(parseFloat(e.target.value))}
                 style={{ width: "260px", marginLeft: "6px" }}
               />
             </div>
@@ -481,9 +599,7 @@ function App() {
                 max="2"
                 step="0.05"
                 value={contrast}
-                onChange={(e) =>
-                  setContrast(parseFloat(e.target.value))
-                }
+                onChange={(e) => setContrast(parseFloat(e.target.value))}
                 style={{ width: "260px", marginLeft: "6px" }}
               />
             </div>
@@ -495,9 +611,7 @@ function App() {
                 max="0.3"
                 step="0.02"
                 value={brightness}
-                onChange={(e) =>
-                  setBrightness(parseFloat(e.target.value))
-                }
+                onChange={(e) => setBrightness(parseFloat(e.target.value))}
                 style={{ width: "260px", marginLeft: "6px" }}
               />
             </div>
