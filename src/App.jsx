@@ -40,8 +40,8 @@ function App() {
         const stream = await navigator.mediaDevices.getUserMedia({
           video: {
             facingMode: "environment",
-            width: { ideal: 2560 },
-            height: { ideal: 1440 },
+            width: { ideal: 3840 },
+            height: { ideal: 2160 },
           },
         });
 
