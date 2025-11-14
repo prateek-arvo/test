@@ -8,6 +8,7 @@ const PADDING_RATIO = 0.05;     // small padding around QR; set 0 for zero extra
 function App() {
   const videoRef = useRef(null);
   const videoTrackRef = useRef(null);
+  const streamRef = useRef(null); // keep stream so we can stop it on capture
 
   const [result, setResult] = useState("");
 
@@ -45,6 +46,7 @@ function App() {
         });
 
         currentStream = stream;
+        streamRef.current = stream;
         const [track] = stream.getVideoTracks();
         videoTrackRef.current = track;
 
@@ -68,10 +70,13 @@ function App() {
     startCamera();
 
     return () => {
+      // Cleanup on unmount
       if (currentStream) {
         currentStream.getTracks().forEach((t) => t.stop());
       }
+      streamRef.current = null;
       videoTrackRef.current = null;
+      if (videoRef.current) videoRef.current.srcObject = null;
       setTorchOn(false);
     };
   }, []);
@@ -89,6 +94,20 @@ function App() {
     } catch (err) {
       console.warn("Torch toggle failed or unsupported:", err);
     }
+  };
+
+  // Helper: stop camera / live stream
+  const stopCamera = () => {
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach((t) => t.stop());
+    }
+    streamRef.current = null;
+    videoTrackRef.current = null;
+    if (videoRef.current) {
+      videoRef.current.srcObject = null;
+    }
+    setTorchOn(false);
+    setTorchSupported(false);
   };
 
   // --- Capture button: snapshot inside bounding box, then ZXing + crops ---
@@ -217,6 +236,9 @@ function App() {
         );
         const centerUrl = centerCanvas.toDataURL("image/png");
         setCenterBase(centerUrl);
+
+        // 8) ✅ Stop live stream now that we captured the photo
+        stopCamera();
       } catch (err) {
         console.error(err);
         alert("No QR found in the bounding box. Try again closer / more centered.");
@@ -321,7 +343,7 @@ function App() {
 
   return (
     <div style={{ textAlign: "center", padding: "20px" }}>
-      <h2>QR → CDP Extractor (Click Capture from Box)</h2>
+      <h2>QR → CDP Extractor (Click Capture from Box, then stop camera)</h2>
 
       <button
         onClick={handleCaptureBox}
