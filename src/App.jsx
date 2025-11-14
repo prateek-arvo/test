@@ -3,17 +3,11 @@ import { BrowserQRCodeReader } from "@zxing/browser";
 
 const BOX_FRACTION = 0.5;       // fraction of min(videoWidth, videoHeight) for the square aim box
 const CENTER_FRACTION = 0.4;    // center patch from QR crop
-
-// Auto-crop / stability controls
-const STABILITY_FRAMES = 4;     // how many recent frames must agree
-const POSITION_TOL_PX = 8;      // allowed movement of QR center
-const SIZE_TOL_RATIO = 0.18;    // allowed size change
 const PADDING_RATIO = 0.05;     // small padding around QR; set 0 for zero extra
 
 function App() {
   const videoRef = useRef(null);
   const videoTrackRef = useRef(null);
-  const qrBoxHistoryRef = useRef([]); // recent QR boxes for stability
 
   const [result, setResult] = useState("");
 
@@ -31,16 +25,17 @@ function App() {
   const [contrast, setContrast] = useState(1.0);       // 0.5–2
   const [brightness, setBrightness] = useState(0.0);   // -0.3–0.3
 
+  // --- Start camera only (no live decoding) ---
   useEffect(() => {
-    const codeReader = new BrowserQRCodeReader();
     let currentStream = null;
-    let controls = null;
-    let locked = false;
 
-    qrBoxHistoryRef.current = [];
-
-    const startCameraAndScan = async () => {
+    const startCamera = async () => {
       try {
+        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+          alert("Camera not supported in this browser.");
+          return;
+        }
+
         const stream = await navigator.mediaDevices.getUserMedia({
           video: {
             facingMode: "environment",
@@ -65,103 +60,19 @@ function App() {
         videoRef.current.srcObject = stream;
         videoRef.current.setAttribute("playsinline", true);
         await videoRef.current.play();
-
-        controls = await codeReader.decodeFromVideoDevice(
-          undefined,
-          videoRef.current,
-          (res, err) => {
-            if (!res || locked || !videoRef.current) return;
-
-            const v = videoRef.current;
-            const vw = v.videoWidth;
-            const vh = v.videoHeight;
-            if (!vw || !vh) return;
-
-            // --- Compute square bounding box in video coords ---
-            const boxSize = Math.floor(Math.min(vw, vh) * BOX_FRACTION);
-            const boxX = Math.floor((vw - boxSize) / 2);
-            const boxY = Math.floor((vh - boxSize) / 2);
-            const boxX2 = boxX + boxSize;
-            const boxY2 = boxY + boxSize;
-
-            // --- QR bounding box from resultPoints ---
-            const pts =
-              (res.getResultPoints && res.getResultPoints()) ||
-              res.resultPoints ||
-              [];
-
-            if (!pts || pts.length < 3) return;
-
-            const xs = pts.map((p) => (p.getX ? p.getX() : p.x));
-            const ys = pts.map((p) => (p.getY ? p.getY() : p.y));
-            let minX = Math.min(...xs);
-            let maxX = Math.max(...xs);
-            let minY = Math.min(...ys);
-            let maxY = Math.max(...ys);
-
-            let qrW = maxX - minX;
-            let qrH = maxY - minY;
-
-            // Require QR to be fully inside the visible square bounding box
-            if (
-              minX < boxX ||
-              minY < boxY ||
-              maxX > boxX2 ||
-              maxY > boxY2
-            ) {
-              // Ignore detections outside / crossing the box
-              qrBoxHistoryRef.current = [];
-              return;
-            }
-
-            // Apply small padding only around QR (still within video bounds)
-            const pad = PADDING_RATIO * Math.max(qrW, qrH);
-            let cropX = Math.max(0, Math.floor(minX - pad));
-            let cropY = Math.max(0, Math.floor(minY - pad));
-            let cropW = Math.min(vw - cropX, Math.floor(qrW + pad * 2));
-            let cropH = Math.min(vh - cropY, Math.floor(qrH + pad * 2));
-
-            const qrBox = { x: cropX, y: cropY, w: cropW, h: cropH };
-            pushQrBox(qrBox);
-
-            // Only proceed once box has been stable over several frames
-            if (!isStable()) return;
-
-            locked = true;
-
-            const text = res.getText ? res.getText() : res.text;
-            setResult(text || "");
-
-            const stableBox = getAverageBox();
-            if (stableBox) {
-              captureQrRegion(v, stableBox);
-            }
-
-            // Stop scanning & camera after capture
-            if (controls) controls.stop();
-            if (currentStream) {
-              currentStream.getTracks().forEach((t) => t.stop());
-            }
-            videoTrackRef.current = null;
-            setTorchOn(false);
-            qrBoxHistoryRef.current = [];
-          }
-        );
       } catch (e) {
-        console.error("Camera or decoding error:", e);
+        console.error("Camera error:", e);
       }
     };
 
-    startCameraAndScan();
+    startCamera();
 
     return () => {
-      if (controls) controls.stop();
       if (currentStream) {
         currentStream.getTracks().forEach((t) => t.stop());
       }
       videoTrackRef.current = null;
       setTorchOn(false);
-      qrBoxHistoryRef.current = [];
     };
   }, []);
 
@@ -180,112 +91,138 @@ function App() {
     }
   };
 
-  // --- Stability helpers (for slow/robust auto-crop) ---
+  // --- Capture button: snapshot inside bounding box, then ZXing + crops ---
 
-  function pushQrBox(box) {
-    const hist = qrBoxHistoryRef.current;
-    hist.push(box);
-    if (hist.length > STABILITY_FRAMES) hist.shift();
-  }
-
-  function getAverageBox() {
-    const hist = qrBoxHistoryRef.current;
-    if (!hist.length) return null;
-    let sx = 0,
-      sy = 0,
-      sw = 0,
-      sh = 0;
-    for (const b of hist) {
-      sx += b.x;
-      sy += b.y;
-      sw += b.w;
-      sh += b.h;
-    }
-    const n = hist.length;
-    return {
-      x: Math.round(sx / n),
-      y: Math.round(sy / n),
-      w: Math.round(sw / n),
-      h: Math.round(sh / n),
-    };
-  }
-
-  function isStable() {
-    const hist = qrBoxHistoryRef.current;
-    if (hist.length < STABILITY_FRAMES) return false;
-
-    const avg = getAverageBox();
-    if (!avg) return false;
-
-    for (const b of hist) {
-      const cx = b.x + b.w / 2;
-      const cy = b.y + b.h / 2;
-      const cax = avg.x + avg.w / 2;
-      const cay = avg.y + avg.h / 2;
-
-      const centerDx = Math.abs(cx - cax);
-      const centerDy = Math.abs(cy - cay);
-      const sizeDrW = Math.abs(b.w - avg.w) / avg.w;
-      const sizeDrH = Math.abs(b.h - avg.h) / avg.h;
-
-      if (
-        centerDx > POSITION_TOL_PX ||
-        centerDy > POSITION_TOL_PX ||
-        sizeDrW > SIZE_TOL_RATIO ||
-        sizeDrH > SIZE_TOL_RATIO
-      ) {
-        return false;
-      }
+  const handleCaptureBox = async () => {
+    if (!videoRef.current) return;
+    const v = videoRef.current;
+    const vw = v.videoWidth;
+    const vh = v.videoHeight;
+    if (!vw || !vh) {
+      console.warn("Video not ready / no dimensions yet.");
+      return;
     }
 
-    return true;
-  }
+    // 1) Draw full frame to canvas
+    const frameCanvas = document.createElement("canvas");
+    frameCanvas.width = vw;
+    frameCanvas.height = vh;
+    const frameCtx = frameCanvas.getContext("2d");
+    frameCtx.drawImage(v, 0, 0, vw, vh);
 
-  // --- Capture: tight QR-only crop based on stable box ---
+    // 2) Compute square bounding box in video coords
+    const boxSize = Math.floor(Math.min(vw, vh) * BOX_FRACTION);
+    const boxX = Math.floor((vw - boxSize) / 2);
+    const boxY = Math.floor((vh - boxSize) / 2);
 
-  function captureQrRegion(video, box) {
-    const { x, y, w, h } = box;
-
-    const qrCanvas = document.createElement("canvas");
-    qrCanvas.width = w;
-    qrCanvas.height = h;
-    const qrCtx = qrCanvas.getContext("2d");
-    qrCtx.drawImage(video, x, y, w, h, 0, 0, w, h);
-
-    const qrUrl = qrCanvas.toDataURL("image/png");
-    setQrBase(qrUrl);
-
-    // Center 40% from within qr-only crop
-    const baseSize = Math.min(w, h);
-    const patchSize = Math.floor(baseSize * CENTER_FRACTION);
-    const cx = Math.floor(w / 2);
-    const cy = Math.floor(h / 2);
-
-    let px = cx - Math.floor(patchSize / 2);
-    let py = cy - Math.floor(patchSize / 2);
-    if (px < 0) px = 0;
-    if (py < 0) py = 0;
-    if (px + patchSize > w) px = w - patchSize;
-    if (py + patchSize > h) py = h - patchSize;
-
-    const centerCanvas = document.createElement("canvas");
-    centerCanvas.width = patchSize;
-    centerCanvas.height = patchSize;
-    const centerCtx = centerCanvas.getContext("2d");
-    centerCtx.drawImage(
-      qrCanvas,
-      px,
-      py,
-      patchSize,
-      patchSize,
+    // 3) Crop that region into its own canvas (Region-of-Interest)
+    const roiCanvas = document.createElement("canvas");
+    roiCanvas.width = boxSize;
+    roiCanvas.height = boxSize;
+    const roiCtx = roiCanvas.getContext("2d");
+    roiCtx.drawImage(
+      frameCanvas,
+      boxX,
+      boxY,
+      boxSize,
+      boxSize,
       0,
       0,
-      patchSize,
-      patchSize
+      boxSize,
+      boxSize
     );
-    const centerUrl = centerCanvas.toDataURL("image/png");
-    setCenterBase(centerUrl);
-  }
+
+    // 4) Run ZXing on this cropped ROI
+    const dataUrl = roiCanvas.toDataURL("image/png");
+    const img = new Image();
+    img.src = dataUrl;
+    img.onload = async () => {
+      try {
+        const reader = new BrowserQRCodeReader();
+        const res = await reader.decodeFromImageElement(img);
+        if (!res) throw new Error("No QR detected in the box");
+
+        const text = res.getText ? res.getText() : res.text;
+        setResult(text || "");
+
+        // 5) QR bounding box from resultPoints in ROI coordinates (0..boxSize)
+        const pts =
+          (res.getResultPoints && res.getResultPoints()) ||
+          res.resultPoints ||
+          [];
+
+        const rw = roiCanvas.width;
+        const rh = roiCanvas.height;
+
+        let x, y, w, h;
+        if (pts && pts.length >= 3) {
+          const xs = pts.map((p) => (p.getX ? p.getX() : p.x));
+          const ys = pts.map((p) => (p.getY ? p.getY() : p.y));
+          const minX = Math.min(...xs);
+          const maxX = Math.max(...xs);
+          const minY = Math.min(...ys);
+          const maxY = Math.max(...ys);
+          const boxW = maxX - minX;
+          const boxH = maxY - minY;
+          const pad = PADDING_RATIO * Math.max(boxW, boxH);
+
+          x = clamp(Math.floor(minX - pad), 0, rw - 1);
+          y = clamp(Math.floor(minY - pad), 0, rh - 1);
+          w = clamp(Math.floor(boxW + pad * 2), 1, rw - x);
+          h = clamp(Math.floor(boxH + pad * 2), 1, rh - y);
+        } else {
+          // Fallback: center square inside ROI
+          const size = Math.floor(Math.min(rw, rh) * 0.5);
+          x = Math.floor((rw - size) / 2);
+          y = Math.floor((rh - size) / 2);
+          w = h = size;
+        }
+
+        // 6) Tight QR-only crop from ROI
+        const qrCanvas = document.createElement("canvas");
+        qrCanvas.width = w;
+        qrCanvas.height = h;
+        const qrCtx = qrCanvas.getContext("2d");
+        qrCtx.drawImage(roiCanvas, x, y, w, h, 0, 0, w, h);
+        const qrUrl = qrCanvas.toDataURL("image/png");
+        setQrBase(qrUrl);
+
+        // 7) Center 40% from within that QR crop
+        const baseSize = Math.min(w, h);
+        const patchSize = Math.floor(baseSize * CENTER_FRACTION);
+        const cx = Math.floor(w / 2);
+        const cy = Math.floor(h / 2);
+
+        let px = cx - Math.floor(patchSize / 2);
+        let py = cy - Math.floor(patchSize / 2);
+        if (px < 0) px = 0;
+        if (py < 0) py = 0;
+        if (px + patchSize > w) px = w - patchSize;
+        if (py + patchSize > h) py = h - patchSize;
+
+        const centerCanvas = document.createElement("canvas");
+        centerCanvas.width = patchSize;
+        centerCanvas.height = patchSize;
+        const centerCtx = centerCanvas.getContext("2d");
+        centerCtx.drawImage(
+          qrCanvas,
+          px,
+          py,
+          patchSize,
+          patchSize,
+          0,
+          0,
+          patchSize,
+          patchSize
+        );
+        const centerUrl = centerCanvas.toDataURL("image/png");
+        setCenterBase(centerUrl);
+      } catch (err) {
+        console.error(err);
+        alert("No QR found in the bounding box. Try again closer / more centered.");
+      }
+    };
+  };
 
   // --- Post-capture processing ---
 
@@ -376,11 +313,28 @@ function App() {
     return new ImageData(out, width, height);
   }
 
+  function clamp(v, lo, hi) {
+    return Math.max(lo, Math.min(hi, v));
+  }
+
   const captured = qrBase && centerBase;
 
   return (
     <div style={{ textAlign: "center", padding: "20px" }}>
-      <h2>QR → CDP Extractor (Box-Aimed, QR-Only Stable Crop)</h2>
+      <h2>QR → CDP Extractor (Click Capture from Box)</h2>
+
+      <button
+        onClick={handleCaptureBox}
+        style={{
+          padding: "10px 16px",
+          borderRadius: 8,
+          border: "1px solid #ccc",
+          cursor: "pointer",
+          marginBottom: 12,
+        }}
+      >
+        Capture Box
+      </button>
 
       <div style={{ position: "relative", display: "inline-block" }}>
         <video
@@ -570,7 +524,7 @@ function App() {
           </div>
         </>
       )}
-    </div> 
+    </div>
   );
 }
 
