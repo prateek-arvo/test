@@ -7,18 +7,18 @@ import * as tf from "@tensorflow/tfjs";
 import maximDeblurring from "@upscalerjs/maxim-deblurring";
 
 const BOX_FRACTION = 0.5;       // fraction of min(videoWidth, videoHeight) for the square aim box
-const CENTER_FRACTION = 0.4;    // center patch from QR crop
+const CENTER_FRACTION = 0.4;    // center patch from QR crop (CDP region)
 const PADDING_RATIO = 0.05;     // padding around QR
 
-// Keep MAXIM input reasonably small to avoid freezing
-const MAXIM_INPUT_MAX = 192;    // max side length of QR sent to MAXIM
+// Keep MAXIM input reasonably small to avoid heavy blocking
+const MAXIM_INPUT_MAX = 192;    // max side length for CDP patch
 const MAXIM_PATCH_SIZE = 64;
 const MAXIM_PADDING = 8;
 
 // Single Upscaler instance for deblurring
 const deblurrer = new Upscaler({ model: maximDeblurring });
 
-// Helper: run UpscalerJS model on a canvas, return a new canvas
+// Run UpscalerJS model on a canvas, return a new canvas
 async function runUpscalerOnCanvas(inputCanvas, upscalerInstance) {
   const inputTensor = tf.browser.fromPixels(inputCanvas);
 
@@ -63,17 +63,15 @@ function App() {
 
   const [result, setResult] = useState("");
 
-  const [qrBase, setQrBase] = useState(null);         // raw cropped QR
-  const [qrDeblurred, setQrDeblurred] = useState(null); // deblurred QR (background)
-  const [centerBase, setCenterBase] = useState(null);
+  const [centerBase, setCenterBase] = useState(null);       // raw CDP region
+  const [centerDeblurred, setCenterDeblurred] = useState(null); // deblurred CDP
 
-  const [qrProcessed, setQrProcessed] = useState(null);
-  const [centerProcessed, setCenterProcessed] = useState(null);
+  const [centerProcessed, setCenterProcessed] = useState(null); // sliders output
 
   const [torchSupported, setTorchSupported] = useState(false);
   const [torchOn, setTorchOn] = useState(false);
 
-  // Post-capture tuning
+  // Post-processing controls on deblurred CDP
   const [sharpAmount, setSharpAmount] = useState(0.3);
   const [contrast, setContrast] = useState(1.0);
   const [brightness, setBrightness] = useState(0.0);
@@ -150,7 +148,21 @@ function App() {
     }
   };
 
-  // --- Capture button: single frame → decode → show cropped QR → deblur QR in background ---
+  // Stop camera feed
+  const stopCamera = () => {
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach((t) => t.stop());
+    }
+    streamRef.current = null;
+    videoTrackRef.current = null;
+    if (videoRef.current) {
+      videoRef.current.srcObject = null;
+    }
+    setTorchOn(false);
+    setTorchSupported(false);
+  };
+
+  // --- Capture button: decode first; if OK stop camera → CDP crop → deblur CDP ---
   const handleCaptureBox = async () => {
     if (!videoRef.current || capturing || isDeblurring) return;
     const v = videoRef.current;
@@ -163,10 +175,8 @@ function App() {
 
     setCapturing(true);
     setResult("");
-    setQrBase(null);
-    setQrDeblurred(null);
     setCenterBase(null);
-    setQrProcessed(null);
+    setCenterDeblurred(null);
     setCenterProcessed(null);
 
     try {
@@ -177,12 +187,12 @@ function App() {
       const frameCtx = frameCanvas.getContext("2d");
       frameCtx.drawImage(v, 0, 0, vw, vh);
 
-      // 2) Compute square bounding box in video coords
+      // 2) Square bounding box in video coords
       const boxSize = Math.floor(Math.min(vw, vh) * BOX_FRACTION);
       const boxX = Math.floor((vw - boxSize) / 2);
       const boxY = Math.floor((vh - boxSize) / 2);
 
-      // 3) Crop bounding box into its own canvas (ROI)
+      // 3) Crop bounding box into ROI canvas
       const roiCanvas = document.createElement("canvas");
       roiCanvas.width = boxSize;
       roiCanvas.height = boxSize;
@@ -199,7 +209,7 @@ function App() {
         boxSize
       );
 
-      // 4) Decode directly from ROI (no MAXIM here → fast)
+      // 4) Decode QR from ROI (fast, no deblur yet)
       const reader = new BrowserQRCodeReader();
       const qrResult = await decodeCanvasWithZXing(roiCanvas, reader);
       if (!qrResult) {
@@ -209,7 +219,7 @@ function App() {
       const text = qrResult.getText ? qrResult.getText() : qrResult.text;
       setResult(text || "");
 
-      // 5) Tight QR bbox from resultPoints in ROI space
+      // 5) Tight QR bbox in ROI space
       const pts =
         (qrResult.getResultPoints && qrResult.getResultPoints()) ||
         qrResult.resultPoints ||
@@ -248,10 +258,8 @@ function App() {
       qrCanvas.height = h;
       const qrCtx = qrCanvas.getContext("2d");
       qrCtx.drawImage(roiCanvas, x, y, w, h, 0, 0, w, h);
-      const qrUrl = qrCanvas.toDataURL("image/png");
-      setQrBase(qrUrl); // immediate raw QR
 
-      // 7) Center 40% from within that QR crop (raw)
+      // 7) CDP region = center 40% of QR crop
       const baseSize = Math.min(w, h);
       const patchSize = Math.floor(baseSize * CENTER_FRACTION);
       const cx = Math.floor(w / 2);
@@ -280,10 +288,13 @@ function App() {
         patchSize
       );
       const centerUrl = centerCanvas.toDataURL("image/png");
-      setCenterBase(centerUrl);
+      setCenterBase(centerUrl); // show raw CDP region
 
-      // 8) Kick off background deblurring of cropped QR
-      deblurQrInBackground(qrCanvas);
+      // ✅ Now that ZXing passed, stop camera feed
+      stopCamera();
+
+      // 8) Run deblurrer on CDP region in background
+      deblurCdpInBackground(centerCanvas);
     } catch (err) {
       console.error(err);
       alert("Couldn’t decode a QR in the box. Try again closer / steadier.");
@@ -292,28 +303,28 @@ function App() {
     }
   };
 
-  // Background deblurring of the cropped QR (no decoding here)
-  const deblurQrInBackground = (qrCanvas) => {
+  // Background deblurring of CDP (center patch)
+  const deblurCdpInBackground = (centerCanvas) => {
     setIsDeblurring(true);
 
-    // Give the UI a chance to paint before heavy work
+    // Let React paint first, then run heavy work
     setTimeout(async () => {
       try {
-        const qw = qrCanvas.width;
-        const qh = qrCanvas.height;
-        const maxSide = Math.max(qw, qh);
+        const cw = centerCanvas.width;
+        const ch = centerCanvas.height;
+        const maxSide = Math.max(cw, ch);
         const scale =
           maxSide > MAXIM_INPUT_MAX ? MAXIM_INPUT_MAX / maxSide : 1;
 
         // Downscale for MAXIM if needed
-        const smallW = Math.max(1, Math.round(qw * scale));
-        const smallH = Math.max(1, Math.round(qh * scale));
+        const smallW = Math.max(1, Math.round(cw * scale));
+        const smallH = Math.max(1, Math.round(ch * scale));
 
         const smallCanvas = document.createElement("canvas");
         smallCanvas.width = smallW;
         smallCanvas.height = smallH;
         const sctx = smallCanvas.getContext("2d");
-        sctx.drawImage(qrCanvas, 0, 0, qw, qh, 0, 0, smallW, smallH);
+        sctx.drawImage(centerCanvas, 0, 0, cw, ch, 0, 0, smallW, smallH);
 
         const enhancedCanvas = await runUpscalerOnCanvas(
           smallCanvas,
@@ -321,7 +332,7 @@ function App() {
         );
 
         const enhancedUrl = enhancedCanvas.toDataURL("image/png");
-        setQrDeblurred(enhancedUrl);
+        setCenterDeblurred(enhancedUrl);
       } catch (err) {
         console.error("Deblurring failed:", err);
       } finally {
@@ -330,19 +341,13 @@ function App() {
     }, 0);
   };
 
-  // --- Post-capture processing (sliders) ---
+  // --- Post-processing sliders apply on deblurred CDP (fallback raw) ---
 
   useEffect(() => {
-    // Prefer deblurred for adjustments; fall back to raw QR
-    const src = qrDeblurred || qrBase;
+    const src = centerDeblurred || centerBase;
     if (!src) return;
-    processImage(src, sharpAmount, contrast, brightness, setQrProcessed);
-  }, [qrBase, qrDeblurred, sharpAmount, contrast, brightness]);
-
-  useEffect(() => {
-    if (!centerBase) return;
-    processImage(centerBase, sharpAmount, contrast, brightness, setCenterProcessed);
-  }, [centerBase, sharpAmount, contrast, brightness]);
+    processImage(src, sharpAmount, contrast, brightness, setCenterProcessed);
+  }, [centerBase, centerDeblurred, sharpAmount, contrast, brightness]);
 
   function processImage(url, sharpAmt, contrastVal, brightnessVal, cb) {
     const img = new Image();
@@ -426,20 +431,20 @@ function App() {
     return Math.max(lo, Math.min(hi, v));
   }
 
-  const captured = qrBase && centerBase;
+  const hasCDP = centerBase != null;
 
   const renderDeblurStatus = () => {
     if (!isDeblurring) return null;
     return (
       <div style={{ marginTop: 8, fontSize: 13, color: "#555" }}>
-        Enhancing QR (deblurring in background)…
+        Enhancing CDP region (deblurring)…
       </div>
     );
   };
 
   return (
     <div style={{ textAlign: "center", padding: "20px" }}>
-      <h2>QR → CDP Extractor (Decode first, Deblur in Background)</h2>
+      <h2>QR → CDP Extractor (Decode → Stop Camera → Deblur CDP)</h2>
 
       <button
         onClick={handleCaptureBox}
@@ -456,52 +461,55 @@ function App() {
         {capturing ? "Capturing…" : "Capture Box"}
       </button>
 
-      <div style={{ position: "relative", display: "inline-block" }}>
-        <video
-          ref={videoRef}
-          style={{
-            width: "100%",
-            maxWidth: "500px",
-            border: "1px solid #ccc",
-            borderRadius: "8px",
-          }}
-        />
-        {/* Square bounding box overlay */}
-        <div
-          style={{
-            position: "absolute",
-            top: "50%",
-            left: "50%",
-            transform: "translate(-50%, -50%)",
-            aspectRatio: "1 / 1",
-            width: `${BOX_FRACTION * 100}%`,
-            border: "2px solid #00ff99",
-            borderRadius: "8px",
-            boxSizing: "border-box",
-            pointerEvents: "none",
-          }}
-        />
-        {torchSupported && (
-          <button
-            onClick={handleToggleTorch}
+      {/* Video only while camera is active */}
+      {streamRef.current && (
+        <div style={{ position: "relative", display: "inline-block" }}>
+          <video
+            ref={videoRef}
+            style={{
+              width: "100%",
+              maxWidth: "500px",
+              border: "1px solid #ccc",
+              borderRadius: "8px",
+            }}
+          />
+          {/* Square bounding box overlay */}
+          <div
             style={{
               position: "absolute",
-              bottom: 10,
-              right: 10,
-              padding: "6px 10px",
-              fontSize: "12px",
-              borderRadius: "6px",
-              border: "none",
-              background: torchOn ? "#ffcc00" : "#333",
-              color: torchOn ? "#000" : "#fff",
-              cursor: "pointer",
-              opacity: 0.9,
+              top: "50%",
+              left: "50%",
+              transform: "translate(-50%, -50%)",
+              aspectRatio: "1 / 1",
+              width: `${BOX_FRACTION * 100}%`,
+              border: "2px solid #00ff99",
+              borderRadius: "8px",
+              boxSizing: "border-box",
+              pointerEvents: "none",
             }}
-          >
-            {torchOn ? "Flash ON" : "Flash OFF"}
-          </button>
-        )}
-      </div>
+          />
+          {torchSupported && (
+            <button
+              onClick={handleToggleTorch}
+              style={{
+                position: "absolute",
+                bottom: 10,
+                right: 10,
+                padding: "6px 10px",
+                fontSize: "12px",
+                borderRadius: "6px",
+                border: "none",
+                background: torchOn ? "#ffcc00" : "#333",
+                color: torchOn ? "#000" : "#fff",
+                cursor: "pointer",
+                opacity: 0.9,
+              }}
+            >
+              {torchOn ? "Flash ON" : "Flash OFF"}
+            </button>
+          )}
+        </div>
+      )}
 
       {renderDeblurStatus()}
 
@@ -523,7 +531,7 @@ function App() {
         </div>
       )}
 
-      {captured && (
+      {hasCDP && (
         <>
           <div
             style={{
@@ -583,50 +591,7 @@ function App() {
             }}
           >
             <div>
-              <h4>QR (raw cropped)</h4>
-              <img
-                src={qrBase}
-                alt="QR raw"
-                style={{
-                  maxWidth: "180px",
-                  borderRadius: "8px",
-                  border: "1px solid #ddd",
-                }}
-              />
-            </div>
-
-            {qrDeblurred && (
-              <div>
-                <h4>QR (deblurred)</h4>
-                <img
-                  src={qrDeblurred}
-                  alt="QR deblurred"
-                  style={{
-                    maxWidth: "180px",
-                    borderRadius: "8px",
-                    border: "1px solid #ddd",
-                  }}
-                />
-              </div>
-            )}
-
-            {qrProcessed && (
-              <div>
-                <h4>QR (adjusted {qrDeblurred ? "deblurred" : "raw"})</h4>
-                <img
-                  src={qrProcessed}
-                  alt="QR adjusted"
-                  style={{
-                    maxWidth: "180px",
-                    borderRadius: "8px",
-                    border: "1px solid #ddd",
-                  }}
-                />
-              </div>
-            )}
-
-            <div>
-              <h4>Center 40% (raw)</h4>
+              <h4>CDP region (raw)</h4>
               <img
                 src={centerBase}
                 alt="Center raw"
@@ -638,9 +603,26 @@ function App() {
               />
             </div>
 
+            {centerDeblurred && (
+              <div>
+                <h4>CDP region (deblurred)</h4>
+                <img
+                  src={centerDeblurred}
+                  alt="Center deblurred"
+                  style={{
+                    maxWidth: "180px",
+                    borderRadius: "8px",
+                    border: "1px solid #ddd",
+                  }}
+                />
+              </div>
+            )}
+
             {centerProcessed && (
               <div>
-                <h4>Center 40% (adjusted)</h4>
+                <h4>
+                  CDP region (adjusted {centerDeblurred ? "deblurred" : "raw"})
+                </h4>
                 <img
                   src={centerProcessed}
                   alt="Center adjusted"
