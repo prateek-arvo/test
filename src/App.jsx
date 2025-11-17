@@ -63,21 +63,21 @@ function App() {
 
   const [result, setResult] = useState("");
 
-  const [centerBase, setCenterBase] = useState(null);       // raw CDP region
+  const [centerBase, setCenterBase] = useState(null);        // raw CDP region
   const [centerDeblurred, setCenterDeblurred] = useState(null); // deblurred CDP
-
   const [centerProcessed, setCenterProcessed] = useState(null); // sliders output
 
   const [torchSupported, setTorchSupported] = useState(false);
   const [torchOn, setTorchOn] = useState(false);
 
-  // Post-processing controls on deblurred CDP
+  // Post-processing controls on CDP
   const [sharpAmount, setSharpAmount] = useState(0.3);
   const [contrast, setContrast] = useState(1.0);
   const [brightness, setBrightness] = useState(0.0);
 
   const [capturing, setCapturing] = useState(false);
   const [isDeblurring, setIsDeblurring] = useState(false);
+  const [cameraReady, setCameraReady] = useState(false);
 
   // --- Start camera on mount ---
   useEffect(() => {
@@ -115,6 +115,7 @@ function App() {
         videoRef.current.srcObject = stream;
         videoRef.current.setAttribute("playsinline", true);
         await videoRef.current.play();
+        setCameraReady(true);
       } catch (e) {
         console.error("Camera error:", e);
       }
@@ -160,6 +161,7 @@ function App() {
     }
     setTorchOn(false);
     setTorchSupported(false);
+    setCameraReady(false);
   };
 
   // --- Capture button: decode first; if OK stop camera → CDP crop → deblur CDP ---
@@ -290,7 +292,7 @@ function App() {
       const centerUrl = centerCanvas.toDataURL("image/png");
       setCenterBase(centerUrl); // show raw CDP region
 
-      // ✅ Now that ZXing passed, stop camera feed
+      // ✅ ZXing passed: stop camera feed now
       stopCamera();
 
       // 8) Run deblurrer on CDP region in background
@@ -448,68 +450,70 @@ function App() {
 
       <button
         onClick={handleCaptureBox}
-        disabled={capturing || isDeblurring}
+        disabled={capturing || isDeblurring || !cameraReady}
         style={{
           padding: "10px 16px",
           borderRadius: 8,
           border: "1px solid #ccc",
-          cursor: capturing || isDeblurring ? "default" : "pointer",
+          cursor: capturing || isDeblurring || !cameraReady ? "default" : "pointer",
           marginBottom: 12,
-          opacity: capturing || isDeblurring ? 0.7 : 1,
+          opacity: capturing || isDeblurring || !cameraReady ? 0.7 : 1,
         }}
       >
-        {capturing ? "Capturing…" : "Capture Box"}
+        {!cameraReady
+          ? "Waiting for camera…"
+          : capturing
+          ? "Capturing…"
+          : "Capture Box"}
       </button>
 
-      {/* Video only while camera is active */}
-      {streamRef.current && (
-        <div style={{ position: "relative", display: "inline-block" }}>
-          <video
-            ref={videoRef}
-            style={{
-              width: "100%",
-              maxWidth: "500px",
-              border: "1px solid #ccc",
-              borderRadius: "8px",
-            }}
-          />
-          {/* Square bounding box overlay */}
-          <div
+      <div style={{ position: "relative", display: "inline-block" }}>
+        <video
+          ref={videoRef}
+          style={{
+            width: "100%",
+            maxWidth: "500px",
+            border: "1px solid #ccc",
+            borderRadius: "8px",
+            background: "#000",
+          }}
+        />
+        {/* Square bounding box overlay (always rendered over video area) */}
+        <div
+          style={{
+            position: "absolute",
+            top: "50%",
+            left: "50%",
+            transform: "translate(-50%, -50%)",
+            aspectRatio: "1 / 1",
+            width: `${BOX_FRACTION * 100}%`,
+            border: "2px solid #00ff99",
+            borderRadius: "8px",
+            boxSizing: "border-box",
+            pointerEvents: "none",
+          }}
+        />
+        {torchSupported && cameraReady && (
+          <button
+            onClick={handleToggleTorch}
             style={{
               position: "absolute",
-              top: "50%",
-              left: "50%",
-              transform: "translate(-50%, -50%)",
-              aspectRatio: "1 / 1",
-              width: `${BOX_FRACTION * 100}%`,
-              border: "2px solid #00ff99",
-              borderRadius: "8px",
-              boxSizing: "border-box",
-              pointerEvents: "none",
+              bottom: 10,
+              right: 10,
+              padding: "6px 10px",
+              fontSize: "12px",
+              borderRadius: "6px",
+              border: "none",
+              background: torchOn ? "#ffcc00" : "#333",
+              color: torchOn ? "#000" : "#fff",
+              cursor: "pointer",
+              opacity: 0.9,
             }}
-          />
-          {torchSupported && (
-            <button
-              onClick={handleToggleTorch}
-              style={{
-                position: "absolute",
-                bottom: 10,
-                right: 10,
-                padding: "6px 10px",
-                fontSize: "12px",
-                borderRadius: "6px",
-                border: "none",
-                background: torchOn ? "#ffcc00" : "#333",
-                color: torchOn ? "#000" : "#fff",
-                cursor: "pointer",
-                opacity: 0.9,
-              }}
-            >
-              {torchOn ? "Flash ON" : "Flash OFF"}
-            </button>
-          )}
-        </div>
-      )}
+          >
+            {torchOn ? "Flash ON" : "Flash OFF"}
+          </button>
+        )}
+      </div>
 
       {renderDeblurStatus()}
 
