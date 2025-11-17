@@ -185,100 +185,105 @@ function App() {
       // 1) Multi-frame merge inside bounding box → roiCanvas
       const roiCanvas = await captureMergedROI(v);
 
-      // 2) Run ZXing on merged ROI
+      // 2) Run ZXing on merged ROI via data URL (no img.onload)
       const dataUrl = roiCanvas.toDataURL("image/png");
-      const img = new Image();
-      img.src = dataUrl;
-      img.onload = async () => {
-        try {
-          const reader = new BrowserQRCodeReader();
-          const res = await reader.decodeFromImageElement(img);
-          if (!res) throw new Error("No QR detected in the merged ROI");
+      const reader = new BrowserQRCodeReader();
 
-          const text = res.getText ? res.getText() : res.text;
-          setResult(text || "");
+      let res;
+      try {
+        res = await reader.decodeFromImageUrl(dataUrl);
+      } catch (err) {
+        console.error("ZXing decode error:", err);
+        alert("No QR detected in the merged area. Try again closer / steadier.");
+        setCapturing(false); // allow retry, keep camera on
+        return;
+      }
 
-          // 3) QR bounding box from resultPoints in ROI coordinates (0..boxSize)
-          const pts =
-            (res.getResultPoints && res.getResultPoints()) ||
-            res.resultPoints ||
-            [];
+      if (!res) {
+        alert("No QR detected in the merged area.");
+        setCapturing(false);
+        return;
+      }
 
-          const rw = roiCanvas.width;
-          const rh = roiCanvas.height;
+      const text = res.getText ? res.getText() : res.text;
+      setResult(text || "");
 
-          let x, y, w, h;
-          if (pts && pts.length >= 3) {
-            const xs = pts.map((p) => (p.getX ? p.getX() : p.x));
-            const ys = pts.map((p) => (p.getY ? p.getY() : p.y));
-            const minX = Math.min(...xs);
-            const maxX = Math.max(...xs);
-            const minY = Math.min(...ys);
-            const maxY = Math.max(...ys);
-            const boxW = maxX - minX;
-            const boxH = maxY - minY;
-            const pad = PADDING_RATIO * Math.max(boxW, boxH);
+      // 3) QR bounding box from resultPoints in ROI coordinates (0..boxSize)
+      const pts =
+        (res.getResultPoints && res.getResultPoints()) ||
+        res.resultPoints ||
+        [];
 
-            x = clamp(Math.floor(minX - pad), 0, rw - 1);
-            y = clamp(Math.floor(minY - pad), 0, rh - 1);
-            w = clamp(Math.floor(boxW + pad * 2), 1, rw - x);
-            h = clamp(Math.floor(boxH + pad * 2), 1, rh - y);
-          } else {
-            // Fallback: center square inside ROI
-            const size = Math.floor(Math.min(rw, rh) * 0.5);
-            x = Math.floor((rw - size) / 2);
-            y = Math.floor((rh - size) / 2);
-            w = h = size;
-          }
+      const rw = roiCanvas.width;
+      const rh = roiCanvas.height;
 
-          // 4) Tight QR-only crop from merged ROI
-          const qrCanvas = document.createElement("canvas");
-          qrCanvas.width = w;
-          qrCanvas.height = h;
-          const qrCtx = qrCanvas.getContext("2d");
-          qrCtx.drawImage(roiCanvas, x, y, w, h, 0, 0, w, h);
-          const qrUrl = qrCanvas.toDataURL("image/png");
-          setQrBase(qrUrl);
+      let x, y, w, h;
+      if (pts && pts.length >= 3) {
+        const xs = pts.map((p) => (p.getX ? p.getX() : p.x));
+        const ys = pts.map((p) => (p.getY ? p.getY() : p.y));
+        const minX = Math.min(...xs);
+        const maxX = Math.max(...xs);
+        const minY = Math.min(...ys);
+        const maxY = Math.max(...ys);
+        const boxW = maxX - minX;
+        const boxH = maxY - minY;
+        const pad = PADDING_RATIO * Math.max(boxW, boxH);
 
-          // 5) Center 40% from within that QR crop
-          const baseSize = Math.min(w, h);
-          const patchSize = Math.floor(baseSize * CENTER_FRACTION);
-          const cx = Math.floor(w / 2);
-          const cy = Math.floor(h / 2);
+        x = clamp(Math.floor(minX - pad), 0, rw - 1);
+        y = clamp(Math.floor(minY - pad), 0, rh - 1);
+        w = clamp(Math.floor(boxW + pad * 2), 1, rw - x);
+        h = clamp(Math.floor(boxH + pad * 2), 1, rh - y);
+      } else {
+        // Fallback: center square inside ROI
+        const size = Math.floor(Math.min(rw, rh) * 0.5);
+        x = Math.floor((rw - size) / 2);
+        y = Math.floor((rh - size) / 2);
+        w = h = size;
+      }
 
-          let px = cx - Math.floor(patchSize / 2);
-          let py = cy - Math.floor(patchSize / 2);
-          if (px < 0) px = 0;
-          if (py < 0) py = 0;
-          if (px + patchSize > w) px = w - patchSize;
-          if (py + patchSize > h) py = h - patchSize;
+      // 4) Tight QR-only crop from merged ROI
+      const qrCanvas = document.createElement("canvas");
+      qrCanvas.width = w;
+      qrCanvas.height = h;
+      const qrCtx = qrCanvas.getContext("2d");
+      qrCtx.drawImage(roiCanvas, x, y, w, h, 0, 0, w, h);
+      const qrUrl = qrCanvas.toDataURL("image/png");
+      setQrBase(qrUrl);
 
-          const centerCanvas = document.createElement("canvas");
-          centerCanvas.width = patchSize;
-          centerCanvas.height = patchSize;
-          const centerCtx = centerCanvas.getContext("2d");
-          centerCtx.drawImage(
-            qrCanvas,
-            px,
-            py,
-            patchSize,
-            patchSize,
-            0,
-            0,
-            patchSize,
-            patchSize
-          );
-          const centerUrl = centerCanvas.toDataURL("image/png");
-          setCenterBase(centerUrl);
+      // 5) Center 40% from within that QR crop
+      const baseSize = Math.min(w, h);
+      const patchSize = Math.floor(baseSize * CENTER_FRACTION);
+      const cx = Math.floor(w / 2);
+      const cy = Math.floor(h / 2);
 
-          // 6) ✅ Stop live stream now that we captured the photo
-          stopCamera();
-        } catch (err) {
-          console.error(err);
-          alert("No QR found in the bounding box (after merge). Try again closer / steadier.");
-          setCapturing(false); // allow retry, keep camera on
-        }
-      };
+      let px = cx - Math.floor(patchSize / 2);
+      let py = cy - Math.floor(patchSize / 2);
+      if (px < 0) px = 0;
+      if (py < 0) py = 0;
+      if (px + patchSize > w) px = w - patchSize;
+      if (py + patchSize > h) py = h - patchSize;
+
+      const centerCanvas = document.createElement("canvas");
+      centerCanvas.width = patchSize;
+      centerCanvas.height = patchSize;
+      const centerCtx = centerCanvas.getContext("2d");
+      centerCtx.drawImage(
+        qrCanvas,
+        px,
+        py,
+        patchSize,
+        patchSize,
+        0,
+        0,
+        patchSize,
+        patchSize
+      );
+      const centerUrl = centerCanvas.toDataURL("image/png");
+      setCenterBase(centerUrl);
+
+      // 6) ✅ Stop live stream now that we captured the photo
+      stopCamera();
+      setCapturing(false);
     } catch (err) {
       console.error(err);
       alert("Capture failed. Try again.");
@@ -455,7 +460,7 @@ function App() {
             style={{
               padding: "8px 12px",
               borderRadius: "6px",
-              border: "1px solid #ddd",
+              border: "1px solid "#ddd",
               display: "inline-block",
               maxWidth: "90%",
               wordBreak: "break-all",
