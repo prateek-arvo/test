@@ -567,7 +567,7 @@ function App() {
                 style={{
                   maxWidth: "180px",
                   borderRadius: "8px",
-                  border: "1px solid "#ddd",
+                  border: "1px solid #ddd",
                 }}
               />
             </div>
@@ -581,7 +581,7 @@ function App() {
                   style={{
                     maxWidth: "180px",
                     borderRadius: "8px",
-                    border: "1px solid "#ddd",
+                    border: "1px solid #ddd",
                   }}
                 />
               </div>
