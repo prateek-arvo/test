@@ -5,6 +5,10 @@ const BOX_FRACTION = 0.5;       // fraction of min(videoWidth, videoHeight) for 
 const CENTER_FRACTION = 0.4;    // center patch from QR crop
 const PADDING_RATIO = 0.05;     // small padding around QR; set 0 for zero extra
 
+// multi-frame merge params
+const BURST_FRAMES = 5;         // how many frames to merge
+const FRAME_DELAY_MS = 30;      // delay between frames in ms
+
 function App() {
   const videoRef = useRef(null);
   const videoTrackRef = useRef(null);
@@ -26,6 +30,8 @@ function App() {
   const [contrast, setContrast] = useState(1.0);       // 0.5–2
   const [brightness, setBrightness] = useState(0.0);   // -0.3–0.3
 
+  const [capturing, setCapturing] = useState(false);
+
   // --- Start camera only (no live decoding) ---
   useEffect(() => {
     let currentStream = null;
@@ -40,8 +46,8 @@ function App() {
         const stream = await navigator.mediaDevices.getUserMedia({
           video: {
             facingMode: "environment",
-            width: { ideal: 3840 },
-            height: { ideal: 2160 },
+            width: { ideal: 2560 },
+            height: { ideal: 1440 },
           },
         });
 
@@ -110,10 +116,62 @@ function App() {
     setTorchSupported(false);
   };
 
-  // --- Capture button: snapshot inside bounding box, then ZXing + crops ---
+  // --- Multi-frame capture & merge inside bounding box ---
+  async function captureMergedROI(video, frames = BURST_FRAMES, delayMs = FRAME_DELAY_MS) {
+    const vw = video.videoWidth;
+    const vh = video.videoHeight;
+    if (!vw || !vh) throw new Error("Video not ready");
+
+    const boxSize = Math.floor(Math.min(vw, vh) * BOX_FRACTION);
+    const boxX = Math.floor((vw - boxSize) / 2);
+    const boxY = Math.floor((vh - boxSize) / 2);
+
+    // Canvas for full frame
+    const frameCanvas = document.createElement("canvas");
+    frameCanvas.width = vw;
+    frameCanvas.height = vh;
+    const frameCtx = frameCanvas.getContext("2d");
+
+    // ROI canvas & accumulator
+    const roiCanvas = document.createElement("canvas");
+    roiCanvas.width = boxSize;
+    roiCanvas.height = boxSize;
+    const roiCtx = roiCanvas.getContext("2d");
+
+    const acc = new Float32Array(boxSize * boxSize * 4);
+
+    for (let i = 0; i < frames; i++) {
+      frameCtx.drawImage(video, 0, 0, vw, vh);
+
+      const imgData = frameCtx.getImageData(boxX, boxY, boxSize, boxSize);
+      const data = imgData.data;
+
+      for (let j = 0; j < data.length; j++) {
+        acc[j] += data[j];
+      }
+
+      if (i < frames - 1) {
+        // small delay so frames differ slightly
+        await new Promise((r) => setTimeout(r, delayMs));
+      }
+    }
+
+    // build averaged ImageData
+    const out = new Uint8ClampedArray(boxSize * boxSize * 4);
+    const invN = 1 / frames;
+    for (let i = 0; i < acc.length; i++) {
+      out[i] = Math.round(acc[i] * invN);
+    }
+    const mergedImageData = new ImageData(out, boxSize, boxSize);
+    roiCtx.putImageData(mergedImageData, 0, 0);
+
+    return roiCanvas;
+  }
+
+  // --- Capture button: multi-frame merge, then ZXing + crops ---
 
   const handleCaptureBox = async () => {
-    if (!videoRef.current) return;
+    if (!videoRef.current || capturing) return;
     const v = videoRef.current;
     const vw = v.videoWidth;
     const vh = v.videoHeight;
@@ -122,128 +180,110 @@ function App() {
       return;
     }
 
-    // 1) Draw full frame to canvas
-    const frameCanvas = document.createElement("canvas");
-    frameCanvas.width = vw;
-    frameCanvas.height = vh;
-    const frameCtx = frameCanvas.getContext("2d");
-    frameCtx.drawImage(v, 0, 0, vw, vh);
+    setCapturing(true);
+    try {
+      // 1) Multi-frame merge inside bounding box → roiCanvas
+      const roiCanvas = await captureMergedROI(v);
 
-    // 2) Compute square bounding box in video coords
-    const boxSize = Math.floor(Math.min(vw, vh) * BOX_FRACTION);
-    const boxX = Math.floor((vw - boxSize) / 2);
-    const boxY = Math.floor((vh - boxSize) / 2);
+      // 2) Run ZXing on merged ROI
+      const dataUrl = roiCanvas.toDataURL("image/png");
+      const img = new Image();
+      img.src = dataUrl;
+      img.onload = async () => {
+        try {
+          const reader = new BrowserQRCodeReader();
+          const res = await reader.decodeFromImageElement(img);
+          if (!res) throw new Error("No QR detected in the merged ROI");
 
-    // 3) Crop that region into its own canvas (Region-of-Interest)
-    const roiCanvas = document.createElement("canvas");
-    roiCanvas.width = boxSize;
-    roiCanvas.height = boxSize;
-    const roiCtx = roiCanvas.getContext("2d");
-    roiCtx.drawImage(
-      frameCanvas,
-      boxX,
-      boxY,
-      boxSize,
-      boxSize,
-      0,
-      0,
-      boxSize,
-      boxSize
-    );
+          const text = res.getText ? res.getText() : res.text;
+          setResult(text || "");
 
-    // 4) Run ZXing on this cropped ROI
-    const dataUrl = roiCanvas.toDataURL("image/png");
-    const img = new Image();
-    img.src = dataUrl;
-    img.onload = async () => {
-      try {
-        const reader = new BrowserQRCodeReader();
-        const res = await reader.decodeFromImageElement(img);
-        if (!res) throw new Error("No QR detected in the box");
+          // 3) QR bounding box from resultPoints in ROI coordinates (0..boxSize)
+          const pts =
+            (res.getResultPoints && res.getResultPoints()) ||
+            res.resultPoints ||
+            [];
 
-        const text = res.getText ? res.getText() : res.text;
-        setResult(text || "");
+          const rw = roiCanvas.width;
+          const rh = roiCanvas.height;
 
-        // 5) QR bounding box from resultPoints in ROI coordinates (0..boxSize)
-        const pts =
-          (res.getResultPoints && res.getResultPoints()) ||
-          res.resultPoints ||
-          [];
+          let x, y, w, h;
+          if (pts && pts.length >= 3) {
+            const xs = pts.map((p) => (p.getX ? p.getX() : p.x));
+            const ys = pts.map((p) => (p.getY ? p.getY() : p.y));
+            const minX = Math.min(...xs);
+            const maxX = Math.max(...xs);
+            const minY = Math.min(...ys);
+            const maxY = Math.max(...ys);
+            const boxW = maxX - minX;
+            const boxH = maxY - minY;
+            const pad = PADDING_RATIO * Math.max(boxW, boxH);
 
-        const rw = roiCanvas.width;
-        const rh = roiCanvas.height;
+            x = clamp(Math.floor(minX - pad), 0, rw - 1);
+            y = clamp(Math.floor(minY - pad), 0, rh - 1);
+            w = clamp(Math.floor(boxW + pad * 2), 1, rw - x);
+            h = clamp(Math.floor(boxH + pad * 2), 1, rh - y);
+          } else {
+            // Fallback: center square inside ROI
+            const size = Math.floor(Math.min(rw, rh) * 0.5);
+            x = Math.floor((rw - size) / 2);
+            y = Math.floor((rh - size) / 2);
+            w = h = size;
+          }
 
-        let x, y, w, h;
-        if (pts && pts.length >= 3) {
-          const xs = pts.map((p) => (p.getX ? p.getX() : p.x));
-          const ys = pts.map((p) => (p.getY ? p.getY() : p.y));
-          const minX = Math.min(...xs);
-          const maxX = Math.max(...xs);
-          const minY = Math.min(...ys);
-          const maxY = Math.max(...ys);
-          const boxW = maxX - minX;
-          const boxH = maxY - minY;
-          const pad = PADDING_RATIO * Math.max(boxW, boxH);
+          // 4) Tight QR-only crop from merged ROI
+          const qrCanvas = document.createElement("canvas");
+          qrCanvas.width = w;
+          qrCanvas.height = h;
+          const qrCtx = qrCanvas.getContext("2d");
+          qrCtx.drawImage(roiCanvas, x, y, w, h, 0, 0, w, h);
+          const qrUrl = qrCanvas.toDataURL("image/png");
+          setQrBase(qrUrl);
 
-          x = clamp(Math.floor(minX - pad), 0, rw - 1);
-          y = clamp(Math.floor(minY - pad), 0, rh - 1);
-          w = clamp(Math.floor(boxW + pad * 2), 1, rw - x);
-          h = clamp(Math.floor(boxH + pad * 2), 1, rh - y);
-        } else {
-          // Fallback: center square inside ROI
-          const size = Math.floor(Math.min(rw, rh) * 0.5);
-          x = Math.floor((rw - size) / 2);
-          y = Math.floor((rh - size) / 2);
-          w = h = size;
+          // 5) Center 40% from within that QR crop
+          const baseSize = Math.min(w, h);
+          const patchSize = Math.floor(baseSize * CENTER_FRACTION);
+          const cx = Math.floor(w / 2);
+          const cy = Math.floor(h / 2);
+
+          let px = cx - Math.floor(patchSize / 2);
+          let py = cy - Math.floor(patchSize / 2);
+          if (px < 0) px = 0;
+          if (py < 0) py = 0;
+          if (px + patchSize > w) px = w - patchSize;
+          if (py + patchSize > h) py = h - patchSize;
+
+          const centerCanvas = document.createElement("canvas");
+          centerCanvas.width = patchSize;
+          centerCanvas.height = patchSize;
+          const centerCtx = centerCanvas.getContext("2d");
+          centerCtx.drawImage(
+            qrCanvas,
+            px,
+            py,
+            patchSize,
+            patchSize,
+            0,
+            0,
+            patchSize,
+            patchSize
+          );
+          const centerUrl = centerCanvas.toDataURL("image/png");
+          setCenterBase(centerUrl);
+
+          // 6) ✅ Stop live stream now that we captured the photo
+          stopCamera();
+        } catch (err) {
+          console.error(err);
+          alert("No QR found in the bounding box (after merge). Try again closer / steadier.");
+          setCapturing(false); // allow retry, keep camera on
         }
-
-        // 6) Tight QR-only crop from ROI
-        const qrCanvas = document.createElement("canvas");
-        qrCanvas.width = w;
-        qrCanvas.height = h;
-        const qrCtx = qrCanvas.getContext("2d");
-        qrCtx.drawImage(roiCanvas, x, y, w, h, 0, 0, w, h);
-        const qrUrl = qrCanvas.toDataURL("image/png");
-        setQrBase(qrUrl);
-
-        // 7) Center 40% from within that QR crop
-        const baseSize = Math.min(w, h);
-        const patchSize = Math.floor(baseSize * CENTER_FRACTION);
-        const cx = Math.floor(w / 2);
-        const cy = Math.floor(h / 2);
-
-        let px = cx - Math.floor(patchSize / 2);
-        let py = cy - Math.floor(patchSize / 2);
-        if (px < 0) px = 0;
-        if (py < 0) py = 0;
-        if (px + patchSize > w) px = w - patchSize;
-        if (py + patchSize > h) py = h - patchSize;
-
-        const centerCanvas = document.createElement("canvas");
-        centerCanvas.width = patchSize;
-        centerCanvas.height = patchSize;
-        const centerCtx = centerCanvas.getContext("2d");
-        centerCtx.drawImage(
-          qrCanvas,
-          px,
-          py,
-          patchSize,
-          patchSize,
-          0,
-          0,
-          patchSize,
-          patchSize
-        );
-        const centerUrl = centerCanvas.toDataURL("image/png");
-        setCenterBase(centerUrl);
-
-        // 8) ✅ Stop live stream now that we captured the photo
-        stopCamera();
-      } catch (err) {
-        console.error(err);
-        alert("No QR found in the bounding box. Try again closer / more centered.");
-      }
-    };
+      };
+    } catch (err) {
+      console.error(err);
+      alert("Capture failed. Try again.");
+      setCapturing(false);
+    }
   };
 
   // --- Post-capture processing ---
@@ -294,6 +334,7 @@ function App() {
 
   function applyUnsharp(imageData, amount = 0.3) {
     const { width, height, data } = imageData;
+    if (amount <= 0.001) return imageData;
     const len = data.length;
     const blur = new Uint8ClampedArray(len);
     const w4 = width * 4;
@@ -343,19 +384,21 @@ function App() {
 
   return (
     <div style={{ textAlign: "center", padding: "20px" }}>
-      <h2>QR → CDP Extractor (Click Capture from Box, then stop camera)</h2>
+      <h2>QR → CDP Extractor (Multi-frame Merge from Box)</h2>
 
       <button
         onClick={handleCaptureBox}
+        disabled={capturing}
         style={{
           padding: "10px 16px",
           borderRadius: 8,
           border: "1px solid #ccc",
-          cursor: "pointer",
+          cursor: capturing ? "default" : "pointer",
           marginBottom: 12,
+          opacity: capturing ? 0.7 : 1,
         }}
       >
-        Capture Box
+        {capturing ? "Capturing…" : "Capture Box (Multi-frame)"}
       </button>
 
       <div style={{ position: "relative", display: "inline-block" }}>
@@ -489,7 +532,7 @@ function App() {
             }}
           >
             <div>
-              <h4>QR (tight crop)</h4>
+              <h4>QR (tight, merged)</h4>
               <img
                 src={qrBase}
                 alt="QR tight"
@@ -517,14 +560,14 @@ function App() {
             )}
 
             <div>
-              <h4>Center 40% (raw)</h4>
+              <h4>Center 40% (raw merged)</h4>
               <img
                 src={centerBase}
                 alt="Center raw"
                 style={{
                   maxWidth: "180px",
                   borderRadius: "8px",
-                  border: "1px solid #ddd",
+                  border: "1px solid "#ddd",
                 }}
               />
             </div>
@@ -538,7 +581,7 @@ function App() {
                   style={{
                     maxWidth: "180px",
                     borderRadius: "8px",
-                    border: "1px solid #ddd",
+                    border: "1px solid "#ddd",
                   }}
                 />
               </div>
