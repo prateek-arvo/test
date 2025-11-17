@@ -1,48 +1,40 @@
 import React, { useEffect, useRef, useState } from "react";
 import { BrowserQRCodeReader } from "@zxing/browser";
 
-const BOX_FRACTION = 0.5;
-const CENTER_FRACTION = 0.4;
-const PADDING_RATIO = 0.05;
-const UPSCALE_FACTOR = 2;
+const BOX_FRACTION = 0.5;        // fraction of min(videoWidth, videoHeight) for the square aim box
+const CENTER_FRACTION = 0.4;     // center patch from QR crop (CDP region)
 
 function App() {
   const videoRef = useRef(null);
   const videoTrackRef = useRef(null);
   const streamRef = useRef(null);
+
   const [result, setResult] = useState("");
+  const [qrBase, setQrBase] = useState(null);          // upscaled QR crop
+  const [centerBase, setCenterBase] = useState(null);  // upscaled CDP region
   const [capturing, setCapturing] = useState(false);
   const [cameraReady, setCameraReady] = useState(false);
+
   const [torchSupported, setTorchSupported] = useState(false);
   const [torchOn, setTorchOn] = useState(false);
 
   // --- Start camera on mount ---
   useEffect(() => {
-    const startCamera = async () => {
-      const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent);
-      const isAndroid = /Android/.test(navigator.userAgent);
-      let currentStream = null;
+    let currentStream = null;
 
+    const startCamera = async () => {
       try {
         if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
           alert("Camera not supported in this browser.");
           return;
         }
 
-        const videoConstraints = isIOS
-          ? {
-              facingMode: "environment",
-              width: { ideal: 1280 },
-              height: { ideal: 720 },
-            }
-          : {
-              facingMode: "environment",
-              width: { ideal: 2560 },
-              height: { ideal: 1440 },
-            };
-
         const stream = await navigator.mediaDevices.getUserMedia({
-          video: videoConstraints,
+          video: {
+            facingMode: "environment",
+            width: { ideal: 2560 },
+            height: { ideal: 1440 },
+          },
         });
 
         currentStream = stream;
@@ -71,8 +63,8 @@ function App() {
     startCamera();
 
     return () => {
-      if (streamRef.current) {
-        streamRef.current.getTracks().forEach((t) => t.stop());
+      if (currentStream) {
+        currentStream.getTracks().forEach((t) => t.stop());
       }
       streamRef.current = null;
       videoTrackRef.current = null;
@@ -81,6 +73,7 @@ function App() {
     };
   }, []);
 
+  // Torch toggle
   const handleToggleTorch = async () => {
     const track = videoTrackRef.current;
     if (!track || !track.getCapabilities || !track.applyConstraints) return;
@@ -95,50 +88,22 @@ function App() {
     }
   };
 
-  // Capture button: decode, stop camera, crop QR + CDP
-  const handleCaptureBox = async () => {
-    if (!videoRef.current || capturing) return;
-    const v = videoRef.current;
-    const vw = v.videoWidth;
-    const vh = v.videoHeight;
-    if (!vw || !vh) return;
-
-    setCapturing(true);
-    setResult("");
-
-    try {
-      const frameCanvas = document.createElement("canvas");
-      frameCanvas.width = vw;
-      frameCanvas.height = vh;
-      const frameCtx = frameCanvas.getContext("2d");
-      frameCtx.drawImage(v, 0, 0, vw, vh);
-
-      const boxSize = Math.floor(Math.min(vw, vh) * BOX_FRACTION);
-      const boxX = Math.floor((vw - boxSize) / 2);
-      const boxY = Math.floor((vh - boxSize) / 2);
-
-      const roiCanvas = document.createElement("canvas");
-      roiCanvas.width = boxSize;
-      roiCanvas.height = boxSize;
-      const roiCtx = roiCanvas.getContext("2d");
-      roiCtx.drawImage(frameCanvas, boxX, boxY, boxSize, boxSize, 0, 0, boxSize, boxSize);
-
-      const reader = new BrowserQRCodeReader();
-      const qrResult = await decodeCanvasWithZXing(roiCanvas, reader);
-      if (!qrResult) throw new Error("No QR detected in the box");
-
-      const text = qrResult.getText ? qrResult.getText() : qrResult.text;
-      setResult(text || "");
-
-      stopCamera();
-    } catch (err) {
-      console.error(err);
-      alert("Couldn’t decode a QR. Try again closer / steadier.");
-    } finally {
-      setCapturing(false);
+  // Stop camera feed
+  const stopCamera = () => {
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach((t) => t.stop());
     }
+    streamRef.current = null;
+    videoTrackRef.current = null;
+    if (videoRef.current) {
+      videoRef.current.srcObject = null;
+    }
+    setTorchOn(false);
+    setTorchSupported(false);
+    setCameraReady(false);
   };
 
+  // Decode a canvas with ZXing
   async function decodeCanvasWithZXing(canvas, reader) {
     const src = canvas.toDataURL("image/png");
     const img = new Image();
@@ -156,96 +121,150 @@ function App() {
     }
   }
 
-  const stopCamera = () => {
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach((t) => t.stop());
+  // --- Capture button: decode, stop camera, crop QR + CDP ---
+  const handleCaptureBox = async () => {
+    if (!videoRef.current || capturing) return;
+    const v = videoRef.current;
+    const vw = v.videoWidth;
+    const vh = v.videoHeight;
+    if (!vw || !vh) {
+      console.warn("Video not ready / no dimensions yet.");
+      return;
     }
-    streamRef.current = null;
-    videoTrackRef.current = null;
-    if (videoRef.current) {
-      videoRef.current.srcObject = null;
+
+    setCapturing(true);
+    setResult("");
+    setQrBase(null);
+    setCenterBase(null);
+
+    try {
+      // 1) Draw full frame to canvas
+      const frameCanvas = document.createElement("canvas");
+      frameCanvas.width = vw;
+      frameCanvas.height = vh;
+      const frameCtx = frameCanvas.getContext("2d");
+      frameCtx.drawImage(v, 0, 0, vw, vh);
+
+      // 2) Square bounding box in video coords
+      const boxSize = Math.floor(Math.min(vw, vh) * BOX_FRACTION);
+      const boxX = Math.floor((vw - boxSize) / 2);
+      const boxY = Math.floor((vh - boxSize) / 2);
+
+      // 3) Crop bounding box into ROI canvas
+      const roiCanvas = document.createElement("canvas");
+      roiCanvas.width = boxSize;
+      roiCanvas.height = boxSize;
+      const roiCtx = roiCanvas.getContext("2d");
+      roiCtx.drawImage(
+        frameCanvas,
+        boxX,
+        boxY,
+        boxSize,
+        boxSize,
+        0,
+        0,
+        boxSize,
+        boxSize
+      );
+
+      // 4) Decode QR from ROI
+      const reader = new BrowserQRCodeReader();
+      const qrResult = await decodeCanvasWithZXing(roiCanvas, reader);
+      if (!qrResult) {
+        throw new Error("No QR detected in the box");
+      }
+
+      const text = qrResult.getText ? qrResult.getText() : qrResult.text;
+      setResult(text || "");
+
+      // 5) Tight QR bbox in ROI space
+      const pts =
+        (qrResult.getResultPoints && qrResult.getResultPoints()) ||
+        qrResult.resultPoints ||
+        [];
+
+      const rw = roiCanvas.width;
+      const rh = roiCanvas.height;
+
+      let x, y, w, h;
+      if (pts && pts.length >= 3) {
+        const xs = pts.map((p) => (p.getX ? p.getX() : p.x));
+        const ys = pts.map((p) => (p.getY ? p.getY() : p.y));
+        const minX = Math.min(...xs);
+        const maxX = Math.max(...xs);
+        const minY = Math.min(...ys);
+        const maxY = Math.max(...ys);
+        const boxW = maxX - minX;
+        const boxH = maxY - minY;
+
+        x = clamp(Math.floor(minX), 0, rw - 1);
+        y = clamp(Math.floor(minY), 0, rh - 1);
+        w = clamp(Math.floor(boxW), 1, rw - x);
+        h = clamp(Math.floor(boxH), 1, rh - y);
+      } else {
+        // Fallback: center square inside ROI
+        const size = Math.floor(Math.min(rw, rh) * 0.5);
+        x = Math.floor((rw - size) / 2);
+        y = Math.floor((rh - size) / 2);
+        w = h = size;
+      }
+
+      // 6) Crop the QR-only region
+      const qrCanvas = document.createElement("canvas");
+      qrCanvas.width = w;
+      qrCanvas.height = h;
+      const qrCtx = qrCanvas.getContext("2d");
+      qrCtx.drawImage(roiCanvas, x, y, w, h, 0, 0, w, h);
+
+      // 7) CDP region = center 40% of QR crop (on original QR canvas)
+      const baseSize = Math.min(w, h);
+      const patchSize = Math.floor(baseSize * CENTER_FRACTION);
+      const cx = Math.floor(w / 2);
+      const cy = Math.floor(h / 2);
+
+      let px = cx - Math.floor(patchSize / 2);
+      let py = cy - Math.floor(patchSize / 2);
+      if (px < 0) px = 0;
+      if (py < 0) py = 0;
+      if (px + patchSize > w) px = w - patchSize;
+      if (py + patchSize > h) py = h - patchSize;
+
+      const cdpCanvas = document.createElement("canvas");
+      cdpCanvas.width = patchSize;
+      cdpCanvas.height = patchSize;
+      const cdpCtx = cdpCanvas.getContext("2d");
+      cdpCtx.drawImage(qrCanvas, px, py, patchSize, patchSize, 0, 0, patchSize, patchSize);
+
+      setQrBase(qrCanvas.toDataURL());
+      setCenterBase(cdpCanvas.toDataURL());
+    } catch (e) {
+      console.error("Capture failed:", e);
     }
-    setTorchOn(false);
+
+    setCapturing(false);
   };
 
+  const clamp = (val, min, max) => Math.max(min, Math.min(max, val));
+
   return (
-    <div style={{ textAlign: "center", padding: "20px" }}>
-      <h2>QR → CDP Extractor</h2>
-      <button
-        onClick={handleCaptureBox}
-        disabled={capturing || !cameraReady}
-        style={{
-          padding: "10px 16px",
-          borderRadius: 8,
-          border: "1px solid #ccc",
-          cursor: capturing || !cameraReady ? "default" : "pointer",
-          marginBottom: 12,
-          opacity: capturing || !cameraReady ? 0.7 : 1,
-        }}
-      >
-        {!cameraReady ? "Waiting for camera…" : capturing ? "Capturing…" : "Capture Box"}
+    <div className="container">
+      <video ref={videoRef} width="100%" autoPlay muted />
+      <button onClick={handleCaptureBox} disabled={capturing}>
+        {capturing ? "Processing..." : "Capture QR Code"}
       </button>
+      {result && <div className="result">QR Code: {result}</div>}
 
-      <div style={{ position: "relative", display: "inline-block" }}>
-        <video
-          ref={videoRef}
-          style={{
-            width: "100%",
-            maxWidth: "500px",
-            border: "1px solid #ccc",
-            borderRadius: "8px",
-            background: "#000",
-          }}
-        />
-        <div
-          style={{
-            position: "absolute",
-            top: "50%",
-            left: "50%",
-            transform: "translate(-50%, -50%)",
-            aspectRatio: "1 / 1",
-            width: `${BOX_FRACTION * 100}%`,
-            border: "2px solid #00ff99",
-            borderRadius: "8px",
-            boxSizing: "border-box",
-            pointerEvents: "none",
-          }}
-        />
-        {torchSupported && (
-          <button
-            onClick={handleToggleTorch}
-            style={{
-              position: "absolute",
-              top: "20px",
-              right: "20px",
-              backgroundColor: torchOn ? "#ff6f61" : "#00c853",
-              color: "#fff",
-              border: "none",
-              padding: "10px 15px",
-              borderRadius: "50%",
-              fontSize: "16px",
-            }}
-          >
-            🔦
-          </button>
-        )}
-      </div>
+      {qrBase && (
+        <div className="cropped-qr">
+          <h3>QR Crop:</h3>
+          <img src={qrBase} alt="QR Region" />
+        </div>
+      )}
 
-      {result && (
-        <div style={{ marginTop: "16px" }}>
-          <h3>QR Content</h3>
-          <p
-            style={{
-              padding: "8px 12px",
-              borderRadius: "6px",
-              border: "1px solid #ddd",
-              display: "inline-block",
-              maxWidth: "90%",
-              wordBreak: "break-all",
-            }}
-          >
-            {result}
-          </p>
+      {centerBase && (
+        <div className="center-patch">
+          <h3>Center Patch (CDP):</h3>
+          <img src={centerBase} alt="CDP Region" />
         </div>
       )}
     </div>
