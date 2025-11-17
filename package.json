@@ -14,6 +14,7 @@
     "@upscalerjs/maxim-deblurring": "^0.1.0",
     "@upscalerjs/maxim-denoising": "^0.1.0",
     "@zxing/browser": "^0.1.5",
+    "jsqr": "^1.4.0",
     "react": "^19.1.0",
     "react-dom": "^19.1.0",
     "upscaler": "^1.0.0-beta.19"

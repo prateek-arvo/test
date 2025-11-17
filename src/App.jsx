@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from "react";
-import { BrowserQRCodeReader } from "@zxing/browser";
+import jsQR from "jsqr"; // Import jsQR
 
 const BOX_FRACTION = 0.5;        // fraction of min(videoWidth, videoHeight) for the square aim box
 const CENTER_FRACTION = 0.4;     // center patch from QR crop (CDP region)
@@ -14,7 +14,6 @@ function App() {
   const [qrBase, setQrBase] = useState(null);          // QR crop
   const [centerBase, setCenterBase] = useState(null);  // CDP region
 
-  // these were missing but are referenced in handleCaptureBox
   const [qrProcessed, setQrProcessed] = useState(null);
   const [centerProcessed, setCenterProcessed] = useState(null);
 
@@ -109,22 +108,12 @@ function App() {
     setCameraReady(false);
   };
 
-  // Decode a canvas with ZXing
-  async function decodeCanvasWithZXing(canvas, reader) {
-    const src = canvas.toDataURL("image/png");
-    const img = new Image();
-    img.src = src;
-    await new Promise((resolve, reject) => {
-      img.onload = resolve;
-      img.onerror = reject;
-    });
-    try {
-      const res = await reader.decodeFromImageElement(img);
-      return res;
-    } catch (e) {
-      console.error("ZXing decode error:", e);
-      return null;
-    }
+  // Decode a canvas with jsQR
+  async function decodeCanvasWithJSQR(canvas) {
+    const frameCtx = canvas.getContext("2d");
+    const imageData = frameCtx.getImageData(0, 0, canvas.width, canvas.height);
+    const decoded = jsQR(imageData.data, canvas.width, canvas.height);
+    return decoded;
   }
 
   // --- Capture button: decode, stop camera, crop QR + CDP ---
@@ -180,22 +169,18 @@ function App() {
         boxSize
       );
 
-      // 4) Decode QR from ROI
-      const reader = new BrowserQRCodeReader();
-      const qrResult = await decodeCanvasWithZXing(roiCanvas, reader);
+      // 4) Decode QR from ROI with jsQR
+      const qrResult = await decodeCanvasWithJSQR(roiCanvas);
 
       if (!qrResult) {
         throw new Error("No QR detected in the box");
       }
 
-      const text = qrResult.getText ? qrResult.getText() : qrResult.text;
+      const text = qrResult.data;
       setResult(text || "");
 
       // 5) Tight QR bbox in ROI space
-      const pts =
-        (qrResult.getResultPoints && qrResult.getResultPoints()) ||
-        qrResult.resultPoints ||
-        [];
+      const pts = qrResult.location || [];
 
       const rw = roiCanvas.width;
       const rh = roiCanvas.height;
@@ -204,8 +189,8 @@ function App() {
 
       let x, y, w, h;
       if (pts && pts.length >= 3) {
-        const xs = pts.map((p) => (p.getX ? p.getX() : p.x));
-        const ys = pts.map((p) => (p.getY ? p.getY() : p.y));
+        const xs = pts.map((p) => p.x);
+        const ys = pts.map((p) => p.y);
         const minX = Math.min(...xs);
         const maxX = Math.max(...xs);
         const minY = Math.min(...ys);
