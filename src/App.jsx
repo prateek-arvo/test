@@ -460,7 +460,7 @@ function App() {
             style={{
               padding: "8px 12px",
               borderRadius: "6px",
-              border: "1px solid "#ddd",
+              border: "1px solid #ddd",
               display: "inline-block",
               maxWidth: "90%",
               wordBreak: "break-all",
