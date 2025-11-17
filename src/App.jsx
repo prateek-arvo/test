@@ -9,20 +9,16 @@ import maximDeblurring from "@upscalerjs/maxim-deblurring";
 
 const BOX_FRACTION = 0.5;       // fraction of min(videoWidth, videoHeight) for the square aim box
 const CENTER_FRACTION = 0.4;    // center patch from QR crop
-const PADDING_RATIO = 0.05;     // small padding around QR; set 0 for zero extra
+const PADDING_RATIO = 0.05;     // padding around QR
 
-// MAXIM config (tune for performance vs. quality)
+// Keep MAXIM input small to avoid freezing
+const MAXIM_INPUT_SIZE = 256;   // process 256x256 instead of full ROI
 const MAXIM_PATCH_SIZE = 64;
 const MAXIM_PADDING = 8;
 
 // Create Upscaler instances once
-const denoiser = new Upscaler({
-  model: maximDenoising,
-});
-
-const deblurrer = new Upscaler({
-  model: maximDeblurring,
-});
+const denoiser = new Upscaler({ model: maximDenoising });
+const deblurrer = new Upscaler({ model: maximDeblurring });
 
 // Helper: run an UpscalerJS model on a canvas, return a new canvas
 async function runUpscalerOnCanvas(inputCanvas, upscalerInstance) {
@@ -65,7 +61,7 @@ async function decodeCanvasWithZXing(canvas, reader) {
 function App() {
   const videoRef = useRef(null);
   const videoTrackRef = useRef(null);
-  const streamRef = useRef(null); // keep stream so we can stop it on capture
+  const streamRef = useRef(null);
 
   const [result, setResult] = useState("");
 
@@ -79,15 +75,15 @@ function App() {
   const [torchOn, setTorchOn] = useState(false);
 
   // Post-capture tuning
-  const [sharpAmount, setSharpAmount] = useState(0.3); // 0–1
-  const [contrast, setContrast] = useState(1.0);       // 0.5–2
-  const [brightness, setBrightness] = useState(0.0);   // -0.3–0.3
+  const [sharpAmount, setSharpAmount] = useState(0.3);
+  const [contrast, setContrast] = useState(1.0);
+  const [brightness, setBrightness] = useState(0.0);
 
   const [capturing, setCapturing] = useState(false);
   const [processingStage, setProcessingStage] = useState(""); // "", "captured", "deblurring", "denoising", "decoding", "done", "error"
-  const [capturedPreview, setCapturedPreview] = useState(null); // ROI screenshot shown while processing
+  const [capturedPreview, setCapturedPreview] = useState(null); // ROI shown while processing
 
-  // --- Start camera only (no live decoding) ---
+  // --- Start camera on mount ---
   useEffect(() => {
     let currentStream = null;
 
@@ -156,7 +152,7 @@ function App() {
     }
   };
 
-  // Helper: stop camera / live stream
+  // Stop the camera feed
   const stopCamera = () => {
     if (streamRef.current) {
       streamRef.current.getTracks().forEach((t) => t.stop());
@@ -170,7 +166,7 @@ function App() {
     setTorchSupported(false);
   };
 
-  // --- Capture button: grab ROI, stop camera, then process ROI in background ---
+  // --- Capture button: single frame, stop camera, then run MAXIM pipeline ---
   const handleCaptureBox = async () => {
     if (!videoRef.current || capturing) return;
     const v = videoRef.current;
@@ -201,7 +197,7 @@ function App() {
     const boxX = Math.floor((vw - boxSize) / 2);
     const boxY = Math.floor((vh - boxSize) / 2);
 
-    // 3) Crop that region into its own canvas (ROI)
+    // 3) Crop bounding box into its own canvas (ROI)
     const roiCanvas = document.createElement("canvas");
     roiCanvas.width = boxSize;
     roiCanvas.height = boxSize;
@@ -218,22 +214,39 @@ function App() {
       boxSize
     );
 
-    // 4) Stop camera feed immediately after capture
+    // 4) Stop camera immediately after capture
     stopCamera();
 
     // 5) Show captured ROI while processing
     const previewUrl = roiCanvas.toDataURL("image/png");
     setCapturedPreview(previewUrl);
 
-    // 6) Kick off background processing (don't await in handler)
+    // 6) Start background processing on a *downscaled* ROI
     processCapturedRoi(roiCanvas);
   };
 
-  // Background processing pipeline for captured ROI
+  // Background processing pipeline: resize → deblur → denoise → decode → crop
   const processCapturedRoi = async (roiCanvas) => {
     try {
+      // Downscale ROI to MAXIM_INPUT_SIZE x MAXIM_INPUT_SIZE
+      const smallCanvas = document.createElement("canvas");
+      smallCanvas.width = MAXIM_INPUT_SIZE;
+      smallCanvas.height = MAXIM_INPUT_SIZE;
+      const sctx = smallCanvas.getContext("2d");
+      sctx.drawImage(
+        roiCanvas,
+        0,
+        0,
+        roiCanvas.width,
+        roiCanvas.height,
+        0,
+        0,
+        MAXIM_INPUT_SIZE,
+        MAXIM_INPUT_SIZE
+      );
+
       setProcessingStage("deblurring");
-      const deblurredCanvas = await runUpscalerOnCanvas(roiCanvas, deblurrer);
+      const deblurredCanvas = await runUpscalerOnCanvas(smallCanvas, deblurrer);
 
       setProcessingStage("denoising");
       const enhancedCanvas = await runUpscalerOnCanvas(deblurredCanvas, denoiser);
@@ -448,7 +461,7 @@ function App() {
 
   return (
     <div style={{ textAlign: "center", padding: "20px" }}>
-      <h2>QR → CDP Extractor (MAXIM, Single Frame, Background Processing)</h2>
+      <h2>QR → CDP Extractor (MAXIM, Single Frame, Small ROI)</h2>
 
       <button
         onClick={handleCaptureBox}
@@ -478,7 +491,7 @@ function App() {
                 borderRadius: "8px",
               }}
             />
-            {/* Square bounding box overlay (aim region) */}
+            {/* Square bounding box overlay */}
             <div
               style={{
                 position: "absolute",
@@ -568,9 +581,7 @@ function App() {
                 max="1"
                 step="0.05"
                 value={sharpAmount}
-                onChange={(e) =>
-                  setSharpAmount(parseFloat(e.target.value))
-                }
+                onChange={(e) => setSharpAmount(parseFloat(e.target.value))}
                 style={{ width: "260px", marginLeft: "6px" }}
               />
             </div>
@@ -582,9 +593,7 @@ function App() {
                 max="2"
                 step="0.05"
                 value={contrast}
-                onChange={(e) =>
-                  setContrast(parseFloat(e.target.value))
-                }
+                onChange={(e) => setContrast(parseFloat(e.target.value))}
                 style={{ width: "260px", marginLeft: "6px" }}
               />
             </div>
@@ -596,9 +605,7 @@ function App() {
                 max="0.3"
                 step="0.02"
                 value={brightness}
-                onChange={(e) =>
-                  setBrightness(parseFloat(e.target.value))
-                }
+                onChange={(e) => setBrightness(parseFloat(e.target.value))}
                 style={{ width: "260px", marginLeft: "6px" }}
               />
             </div>
