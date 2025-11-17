@@ -1,26 +1,24 @@
 import React, { useEffect, useRef, useState } from "react";
 import { BrowserQRCodeReader } from "@zxing/browser";
 
-// UpscalerJS + MAXIM models
+// UpscalerJS + MAXIM Deblurring
 import Upscaler from "upscaler";
 import * as tf from "@tensorflow/tfjs";
-import maximDenoising from "@upscalerjs/maxim-denoising";
 import maximDeblurring from "@upscalerjs/maxim-deblurring";
 
 const BOX_FRACTION = 0.5;       // fraction of min(videoWidth, videoHeight) for the square aim box
 const CENTER_FRACTION = 0.4;    // center patch from QR crop
 const PADDING_RATIO = 0.05;     // padding around QR
 
-// Keep MAXIM input small to avoid freezing
-const MAXIM_INPUT_SIZE = 256;   // process 256x256 instead of full ROI
+// Keep MAXIM input reasonably small to avoid freezing
+const MAXIM_INPUT_MAX = 192;    // max side length of QR sent to MAXIM
 const MAXIM_PATCH_SIZE = 64;
 const MAXIM_PADDING = 8;
 
-// Create Upscaler instances once
-const denoiser = new Upscaler({ model: maximDenoising });
+// Single Upscaler instance for deblurring
 const deblurrer = new Upscaler({ model: maximDeblurring });
 
-// Helper: run an UpscalerJS model on a canvas, return a new canvas
+// Helper: run UpscalerJS model on a canvas, return a new canvas
 async function runUpscalerOnCanvas(inputCanvas, upscalerInstance) {
   const inputTensor = tf.browser.fromPixels(inputCanvas);
 
@@ -65,7 +63,8 @@ function App() {
 
   const [result, setResult] = useState("");
 
-  const [qrBase, setQrBase] = useState(null);
+  const [qrBase, setQrBase] = useState(null);         // raw cropped QR
+  const [qrDeblurred, setQrDeblurred] = useState(null); // deblurred QR (background)
   const [centerBase, setCenterBase] = useState(null);
 
   const [qrProcessed, setQrProcessed] = useState(null);
@@ -80,8 +79,7 @@ function App() {
   const [brightness, setBrightness] = useState(0.0);
 
   const [capturing, setCapturing] = useState(false);
-  const [processingStage, setProcessingStage] = useState(""); // "", "captured", "deblurring", "denoising", "decoding", "done", "error"
-  const [capturedPreview, setCapturedPreview] = useState(null); // ROI shown while processing
+  const [isDeblurring, setIsDeblurring] = useState(false);
 
   // --- Start camera on mount ---
   useEffect(() => {
@@ -152,23 +150,9 @@ function App() {
     }
   };
 
-  // Stop the camera feed
-  const stopCamera = () => {
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach((t) => t.stop());
-    }
-    streamRef.current = null;
-    videoTrackRef.current = null;
-    if (videoRef.current) {
-      videoRef.current.srcObject = null;
-    }
-    setTorchOn(false);
-    setTorchSupported(false);
-  };
-
-  // --- Capture button: single frame, stop camera, then run MAXIM pipeline ---
+  // --- Capture button: single frame → decode → show cropped QR → deblur QR in background ---
   const handleCaptureBox = async () => {
-    if (!videoRef.current || capturing) return;
+    if (!videoRef.current || capturing || isDeblurring) return;
     const v = videoRef.current;
     const vw = v.videoWidth;
     const vh = v.videoHeight;
@@ -178,97 +162,61 @@ function App() {
     }
 
     setCapturing(true);
-    setProcessingStage("captured");
     setResult("");
     setQrBase(null);
+    setQrDeblurred(null);
     setCenterBase(null);
     setQrProcessed(null);
     setCenterProcessed(null);
 
-    // 1) Draw full frame to canvas
-    const frameCanvas = document.createElement("canvas");
-    frameCanvas.width = vw;
-    frameCanvas.height = vh;
-    const frameCtx = frameCanvas.getContext("2d");
-    frameCtx.drawImage(v, 0, 0, vw, vh);
-
-    // 2) Compute square bounding box in video coords
-    const boxSize = Math.floor(Math.min(vw, vh) * BOX_FRACTION);
-    const boxX = Math.floor((vw - boxSize) / 2);
-    const boxY = Math.floor((vh - boxSize) / 2);
-
-    // 3) Crop bounding box into its own canvas (ROI)
-    const roiCanvas = document.createElement("canvas");
-    roiCanvas.width = boxSize;
-    roiCanvas.height = boxSize;
-    const roiCtx = roiCanvas.getContext("2d");
-    roiCtx.drawImage(
-      frameCanvas,
-      boxX,
-      boxY,
-      boxSize,
-      boxSize,
-      0,
-      0,
-      boxSize,
-      boxSize
-    );
-
-    // 4) Stop camera immediately after capture
-    stopCamera();
-
-    // 5) Show captured ROI while processing
-    const previewUrl = roiCanvas.toDataURL("image/png");
-    setCapturedPreview(previewUrl);
-
-    // 6) Start background processing on a *downscaled* ROI
-    processCapturedRoi(roiCanvas);
-  };
-
-  // Background processing pipeline: resize → deblur → denoise → decode → crop
-  const processCapturedRoi = async (roiCanvas) => {
     try {
-      // Downscale ROI to MAXIM_INPUT_SIZE x MAXIM_INPUT_SIZE
-      const smallCanvas = document.createElement("canvas");
-      smallCanvas.width = MAXIM_INPUT_SIZE;
-      smallCanvas.height = MAXIM_INPUT_SIZE;
-      const sctx = smallCanvas.getContext("2d");
-      sctx.drawImage(
-        roiCanvas,
+      // 1) Draw full frame to canvas
+      const frameCanvas = document.createElement("canvas");
+      frameCanvas.width = vw;
+      frameCanvas.height = vh;
+      const frameCtx = frameCanvas.getContext("2d");
+      frameCtx.drawImage(v, 0, 0, vw, vh);
+
+      // 2) Compute square bounding box in video coords
+      const boxSize = Math.floor(Math.min(vw, vh) * BOX_FRACTION);
+      const boxX = Math.floor((vw - boxSize) / 2);
+      const boxY = Math.floor((vh - boxSize) / 2);
+
+      // 3) Crop bounding box into its own canvas (ROI)
+      const roiCanvas = document.createElement("canvas");
+      roiCanvas.width = boxSize;
+      roiCanvas.height = boxSize;
+      const roiCtx = roiCanvas.getContext("2d");
+      roiCtx.drawImage(
+        frameCanvas,
+        boxX,
+        boxY,
+        boxSize,
+        boxSize,
         0,
         0,
-        roiCanvas.width,
-        roiCanvas.height,
-        0,
-        0,
-        MAXIM_INPUT_SIZE,
-        MAXIM_INPUT_SIZE
+        boxSize,
+        boxSize
       );
 
-      setProcessingStage("deblurring");
-      const deblurredCanvas = await runUpscalerOnCanvas(smallCanvas, deblurrer);
-
-      setProcessingStage("denoising");
-      const enhancedCanvas = await runUpscalerOnCanvas(deblurredCanvas, denoiser);
-
-      setProcessingStage("decoding");
+      // 4) Decode directly from ROI (no MAXIM here → fast)
       const reader = new BrowserQRCodeReader();
-      const qrResult = await decodeCanvasWithZXing(enhancedCanvas, reader);
+      const qrResult = await decodeCanvasWithZXing(roiCanvas, reader);
       if (!qrResult) {
-        throw new Error("No QR detected in enhanced ROI");
+        throw new Error("No QR detected in the box");
       }
 
       const text = qrResult.getText ? qrResult.getText() : qrResult.text;
       setResult(text || "");
 
-      // Compute tight QR bbox from resultPoints in enhancedCanvas space
+      // 5) Tight QR bbox from resultPoints in ROI space
       const pts =
         (qrResult.getResultPoints && qrResult.getResultPoints()) ||
         qrResult.resultPoints ||
         [];
 
-      const rw = enhancedCanvas.width;
-      const rh = enhancedCanvas.height;
+      const rw = roiCanvas.width;
+      const rh = roiCanvas.height;
 
       let x, y, w, h;
       if (pts && pts.length >= 3) {
@@ -287,23 +235,23 @@ function App() {
         w = clamp(Math.floor(boxW + pad * 2), 1, rw - x);
         h = clamp(Math.floor(boxH + pad * 2), 1, rh - y);
       } else {
-        // Fallback: center square inside enhanced ROI
+        // Fallback: center square inside ROI
         const size = Math.floor(Math.min(rw, rh) * 0.5);
         x = Math.floor((rw - size) / 2);
         y = Math.floor((rh - size) / 2);
         w = h = size;
       }
 
-      // Tight QR-only crop from enhanced ROI
+      // 6) Tight QR-only crop from ROI
       const qrCanvas = document.createElement("canvas");
       qrCanvas.width = w;
       qrCanvas.height = h;
       const qrCtx = qrCanvas.getContext("2d");
-      qrCtx.drawImage(enhancedCanvas, x, y, w, h, 0, 0, w, h);
+      qrCtx.drawImage(roiCanvas, x, y, w, h, 0, 0, w, h);
       const qrUrl = qrCanvas.toDataURL("image/png");
-      setQrBase(qrUrl);
+      setQrBase(qrUrl); // immediate raw QR
 
-      // Center 40% from within that QR crop
+      // 7) Center 40% from within that QR crop (raw)
       const baseSize = Math.min(w, h);
       const patchSize = Math.floor(baseSize * CENTER_FRACTION);
       const cx = Math.floor(w / 2);
@@ -334,24 +282,62 @@ function App() {
       const centerUrl = centerCanvas.toDataURL("image/png");
       setCenterBase(centerUrl);
 
-      setProcessingStage("done");
+      // 8) Kick off background deblurring of cropped QR
+      deblurQrInBackground(qrCanvas);
     } catch (err) {
       console.error(err);
-      setProcessingStage("error");
-      alert(
-        "Couldn’t decode a QR in the box, even after deblur/denoise. Try again closer / steadier."
-      );
+      alert("Couldn’t decode a QR in the box. Try again closer / steadier.");
     } finally {
       setCapturing(false);
     }
   };
 
+  // Background deblurring of the cropped QR (no decoding here)
+  const deblurQrInBackground = (qrCanvas) => {
+    setIsDeblurring(true);
+
+    // Give the UI a chance to paint before heavy work
+    setTimeout(async () => {
+      try {
+        const qw = qrCanvas.width;
+        const qh = qrCanvas.height;
+        const maxSide = Math.max(qw, qh);
+        const scale =
+          maxSide > MAXIM_INPUT_MAX ? MAXIM_INPUT_MAX / maxSide : 1;
+
+        // Downscale for MAXIM if needed
+        const smallW = Math.max(1, Math.round(qw * scale));
+        const smallH = Math.max(1, Math.round(qh * scale));
+
+        const smallCanvas = document.createElement("canvas");
+        smallCanvas.width = smallW;
+        smallCanvas.height = smallH;
+        const sctx = smallCanvas.getContext("2d");
+        sctx.drawImage(qrCanvas, 0, 0, qw, qh, 0, 0, smallW, smallH);
+
+        const enhancedCanvas = await runUpscalerOnCanvas(
+          smallCanvas,
+          deblurrer
+        );
+
+        const enhancedUrl = enhancedCanvas.toDataURL("image/png");
+        setQrDeblurred(enhancedUrl);
+      } catch (err) {
+        console.error("Deblurring failed:", err);
+      } finally {
+        setIsDeblurring(false);
+      }
+    }, 0);
+  };
+
   // --- Post-capture processing (sliders) ---
 
   useEffect(() => {
-    if (!qrBase) return;
-    processImage(qrBase, sharpAmount, contrast, brightness, setQrProcessed);
-  }, [qrBase, sharpAmount, contrast, brightness]);
+    // Prefer deblurred for adjustments; fall back to raw QR
+    const src = qrDeblurred || qrBase;
+    if (!src) return;
+    processImage(src, sharpAmount, contrast, brightness, setQrProcessed);
+  }, [qrBase, qrDeblurred, sharpAmount, contrast, brightness]);
 
   useEffect(() => {
     if (!centerBase) return;
@@ -442,106 +428,82 @@ function App() {
 
   const captured = qrBase && centerBase;
 
-  const renderProcessingLabel = () => {
-    if (!processingStage || processingStage === "done" || processingStage === "error") {
-      return null;
-    }
-    let text = "";
-    if (processingStage === "captured") text = "Captured frame, preparing…";
-    if (processingStage === "deblurring") text = "Deblurring with MAXIM…";
-    if (processingStage === "denoising") text = "Denoising with MAXIM…";
-    if (processingStage === "decoding") text = "Decoding QR…";
-
+  const renderDeblurStatus = () => {
+    if (!isDeblurring) return null;
     return (
       <div style={{ marginTop: 8, fontSize: 13, color: "#555" }}>
-        {text}
+        Enhancing QR (deblurring in background)…
       </div>
     );
   };
 
   return (
     <div style={{ textAlign: "center", padding: "20px" }}>
-      <h2>QR → CDP Extractor (MAXIM, Single Frame, Small ROI)</h2>
+      <h2>QR → CDP Extractor (Decode first, Deblur in Background)</h2>
 
       <button
         onClick={handleCaptureBox}
-        disabled={capturing || !!capturedPreview}
+        disabled={capturing || isDeblurring}
         style={{
           padding: "10px 16px",
           borderRadius: 8,
           border: "1px solid #ccc",
-          cursor: capturing || capturedPreview ? "default" : "pointer",
+          cursor: capturing || isDeblurring ? "default" : "pointer",
           marginBottom: 12,
-          opacity: capturing || capturedPreview ? 0.7 : 1,
+          opacity: capturing || isDeblurring ? 0.7 : 1,
         }}
       >
-        {capturing ? "Capturing…" : capturedPreview ? "Captured" : "Capture Box"}
+        {capturing ? "Capturing…" : "Capture Box"}
       </button>
 
       <div style={{ position: "relative", display: "inline-block" }}>
-        {/* If we have a captured preview, show it instead of live video */}
-        {!capturedPreview ? (
-          <>
-            <video
-              ref={videoRef}
-              style={{
-                width: "100%",
-                maxWidth: "500px",
-                border: "1px solid #ccc",
-                borderRadius: "8px",
-              }}
-            />
-            {/* Square bounding box overlay */}
-            <div
-              style={{
-                position: "absolute",
-                top: "50%",
-                left: "50%",
-                transform: "translate(-50%, -50%)",
-                aspectRatio: "1 / 1",
-                width: `${BOX_FRACTION * 100}%`,
-                border: "2px solid #00ff99",
-                borderRadius: "8px",
-                boxSizing: "border-box",
-                pointerEvents: "none",
-              }}
-            />
-            {torchSupported && (
-              <button
-                onClick={handleToggleTorch}
-                style={{
-                  position: "absolute",
-                  bottom: 10,
-                  right: 10,
-                  padding: "6px 10px",
-                  fontSize: "12px",
-                  borderRadius: "6px",
-                  border: "none",
-                  background: torchOn ? "#ffcc00" : "#333",
-                  color: torchOn ? "#000" : "#fff",
-                  cursor: "pointer",
-                  opacity: 0.9,
-                }}
-              >
-                {torchOn ? "Flash ON" : "Flash OFF"}
-              </button>
-            )}
-          </>
-        ) : (
-          <img
-            src={capturedPreview}
-            alt="Captured ROI"
+        <video
+          ref={videoRef}
+          style={{
+            width: "100%",
+            maxWidth: "500px",
+            border: "1px solid #ccc",
+            borderRadius: "8px",
+          }}
+        />
+        {/* Square bounding box overlay */}
+        <div
+          style={{
+            position: "absolute",
+            top: "50%",
+            left: "50%",
+            transform: "translate(-50%, -50%)",
+            aspectRatio: "1 / 1",
+            width: `${BOX_FRACTION * 100}%`,
+            border: "2px solid #00ff99",
+            borderRadius: "8px",
+            boxSizing: "border-box",
+            pointerEvents: "none",
+          }}
+        />
+        {torchSupported && (
+          <button
+            onClick={handleToggleTorch}
             style={{
-              width: "100%",
-              maxWidth: "500px",
-              border: "1px solid #ccc",
-              borderRadius: "8px",
+              position: "absolute",
+              bottom: 10,
+              right: 10,
+              padding: "6px 10px",
+              fontSize: "12px",
+              borderRadius: "6px",
+              border: "none",
+              background: torchOn ? "#ffcc00" : "#333",
+              color: torchOn ? "#000" : "#fff",
+              cursor: "pointer",
+              opacity: 0.9,
             }}
-          />
+          >
+            {torchOn ? "Flash ON" : "Flash OFF"}
+          </button>
         )}
       </div>
 
-      {renderProcessingLabel()}
+      {renderDeblurStatus()}
 
       {result && (
         <div style={{ marginTop: "16px" }}>
@@ -621,10 +583,10 @@ function App() {
             }}
           >
             <div>
-              <h4>QR (tight, enhanced)</h4>
+              <h4>QR (raw cropped)</h4>
               <img
                 src={qrBase}
-                alt="QR tight"
+                alt="QR raw"
                 style={{
                   maxWidth: "180px",
                   borderRadius: "8px",
@@ -633,9 +595,24 @@ function App() {
               />
             </div>
 
+            {qrDeblurred && (
+              <div>
+                <h4>QR (deblurred)</h4>
+                <img
+                  src={qrDeblurred}
+                  alt="QR deblurred"
+                  style={{
+                    maxWidth: "180px",
+                    borderRadius: "8px",
+                    border: "1px solid #ddd",
+                  }}
+                />
+              </div>
+            )}
+
             {qrProcessed && (
               <div>
-                <h4>QR (adjusted)</h4>
+                <h4>QR (adjusted {qrDeblurred ? "deblurred" : "raw"})</h4>
                 <img
                   src={qrProcessed}
                   alt="QR adjusted"
@@ -649,7 +626,7 @@ function App() {
             )}
 
             <div>
-              <h4>Center 40% (raw enhanced)</h4>
+              <h4>Center 40% (raw)</h4>
               <img
                 src={centerBase}
                 alt="Center raw"
