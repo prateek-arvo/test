@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from "react";
-import jsQR from "jsqr"; // Import jsQR
+import jsQR from "jsqr";
 
 const BOX_FRACTION = 0.5;        // fraction of min(videoWidth, videoHeight) for the square aim box
 const CENTER_FRACTION = 0.4;     // center patch from QR crop (CDP region)
@@ -14,6 +14,7 @@ function App() {
   const [qrBase, setQrBase] = useState(null);          // QR crop
   const [centerBase, setCenterBase] = useState(null);  // CDP region
 
+  // referenced in your handler, so keep them even if unused in UI
   const [qrProcessed, setQrProcessed] = useState(null);
   const [centerProcessed, setCenterProcessed] = useState(null);
 
@@ -109,11 +110,24 @@ function App() {
   };
 
   // Decode a canvas with jsQR
-  async function decodeCanvasWithJSQR(canvas) {
-    const frameCtx = canvas.getContext("2d");
-    const imageData = frameCtx.getImageData(0, 0, canvas.width, canvas.height);
-    const decoded = jsQR(imageData.data, canvas.width, canvas.height);
-    return decoded;
+  async function decodeCanvasWithJsQR(canvas) {
+    const ctx = canvas.getContext("2d");
+    const width = canvas.width;
+    const height = canvas.height;
+    const imageData = ctx.getImageData(0, 0, width, height);
+
+    // jsQR works directly on RGBA buffer
+    const qr = jsQR(imageData.data, width, height, {
+      inversionAttempts: "attemptBoth",
+    });
+
+    if (!qr) {
+      console.log("jsQR: no QR found");
+      return null;
+    }
+
+    // qr.data: string; qr.location: corners + etc.
+    return qr;
   }
 
   // --- Capture button: decode, stop camera, crop QR + CDP ---
@@ -169,8 +183,8 @@ function App() {
         boxSize
       );
 
-      // 4) Decode QR from ROI with jsQR
-      const qrResult = await decodeCanvasWithJSQR(roiCanvas);
+      // 4) Decode QR from ROI using jsQR
+      const qrResult = await decodeCanvasWithJsQr(roiCanvas);
 
       if (!qrResult) {
         throw new Error("No QR detected in the box");
@@ -179,8 +193,14 @@ function App() {
       const text = qrResult.data;
       setResult(text || "");
 
-      // 5) Tight QR bbox in ROI space
-      const pts = qrResult.location || [];
+      // 5) Tight QR bbox in ROI space using jsQR.location
+      const loc = qrResult.location;
+      const pts = [
+        loc.topLeftCorner,
+        loc.topRightCorner,
+        loc.bottomRightCorner,
+        loc.bottomLeftCorner,
+      ];
 
       const rw = roiCanvas.width;
       const rh = roiCanvas.height;
