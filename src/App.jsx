@@ -1,28 +1,33 @@
 import React, { useEffect, useRef, useState } from "react";
-import jsQR from "jsqr";
 
-const BOX_FRACTION = 0.5;        // fraction of min(videoWidth, videoHeight) for the square aim box
-const CENTER_FRACTION = 0.4;     // center patch from QR crop (CDP region)
-const PADDING_RATIO = 0.05;      // small padding around QR bbox
+const API_URL = "https://9ahp0tc529.execute-api.ap-south-1.amazonaws.com/dev";
+
+const IDS = [
+  "79604928-2f65-4c8m",
+  "79604928-2f65-4c8o",
+  "79604928-2f65-4c8j",
+  "79604928-2f65-4c8w",
+  "79604928-2f65-4c8q",
+  "79604928-2f65-4c8d",
+];
+
+function getRandomId() {
+  const idx = Math.floor(Math.random() * IDS.length);
+  return IDS[idx];
+}
 
 function App() {
   const videoRef = useRef(null);
   const videoTrackRef = useRef(null);
   const streamRef = useRef(null);
 
-  const [result, setResult] = useState("");
-  const [qrBase, setQrBase] = useState(null);          // QR crop
-  const [centerBase, setCenterBase] = useState(null);  // CDP region
-
-  // kept so your reset calls don't crash
-  const [qrProcessed, setQrProcessed] = useState(null);
-  const [centerProcessed, setCenterProcessed] = useState(null);
-
   const [capturing, setCapturing] = useState(false);
   const [cameraReady, setCameraReady] = useState(false);
-
   const [torchSupported, setTorchSupported] = useState(false);
   const [torchOn, setTorchOn] = useState(false);
+
+  const [apiResult, setApiResult] = useState(null);
+  const [capturedImageDataUrl, setCapturedImageDataUrl] = useState(null);
 
   // --- Start camera on mount ---
   useEffect(() => {
@@ -109,16 +114,12 @@ function App() {
     setCameraReady(false);
   };
 
-  const clamp = (val, min, max) => Math.max(min, Math.min(max, val));
-
-  // --- Capture button: decode (ROI, then fallback full frame), stop camera, crop QR + CDP ---
-  const handleCaptureBox = async () => {
+  // --- Capture full frame, send to API ---
+  const handleCapture = async () => {
     if (!videoRef.current || capturing) return;
     const videoElement = videoRef.current;
     const vw = videoElement.videoWidth;
     const vh = videoElement.videoHeight;
-
-    console.log("Video Width:", vw, "Video Height:", vh); // Debugging
 
     if (!vw || !vh) {
       console.warn("Video not ready / no dimensions yet.");
@@ -126,185 +127,54 @@ function App() {
     }
 
     setCapturing(true);
-    setResult("");
-    setQrBase(null);
-    setCenterBase(null);
-    setQrProcessed(null);
-    setCenterProcessed(null);
+    setApiResult(null);
 
     try {
-      // 1) Draw full frame to canvas (same high quality as before)
-      const frameCanvas = document.createElement("canvas");
-      frameCanvas.width = vw;
-      frameCanvas.height = vh;
-      const frameCtx = frameCanvas.getContext("2d");
-      frameCtx.drawImage(videoElement, 0, 0, vw, vh);
+      // 1) Draw full high-res frame to canvas
+      const canvas = document.createElement("canvas");
+      canvas.width = vw;
+      canvas.height = vh;
+      const ctx = canvas.getContext("2d");
+      ctx.drawImage(videoElement, 0, 0, vw, vh);
 
-      // 2) Square bounding box in video coords (for ROI)
-      const boxSize = Math.floor(Math.min(vw, vh) * BOX_FRACTION);
-      const boxX = Math.floor((vw - boxSize) / 2);
-      const boxY = Math.floor((vh - boxSize) / 2);
+      // 2) Convert to data URL (high quality JPEG)
+      const dataUrl = canvas.toDataURL("image/jpeg", 1.0); // quality 1.0
+      setCapturedImageDataUrl(dataUrl);
 
-      console.log("Box X:", boxX, "Box Y:", boxY, "Box Size:", boxSize); // Debugging
+      // 3) Strip base64 prefix: "data:image/jpeg;base64,..."
+      const base64 = dataUrl.split(",")[1];
 
-      // 3) Crop bounding box into ROI canvas
-      const roiCanvas = document.createElement("canvas");
-      roiCanvas.width = boxSize;
-      roiCanvas.height = boxSize;
-      const roiCtx = roiCanvas.getContext("2d");
-      roiCtx.drawImage(
-        frameCanvas,
-        boxX,
-        boxY,
-        boxSize,
-        boxSize,
-        0,
-        0,
-        boxSize,
-        boxSize
-      );
+      // 4) Build payload with random id
+      const payload = {
+        id: getRandomId(),
+        image_base64: base64,
+      };
 
-      const rw = roiCanvas.width;
-      const rh = roiCanvas.height;
+      // 5) Call API
+      const res = await fetch(API_URL, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(payload),
+      });
 
-      // 4) Try decode QR from ROI using jsQR
-      let qrResult = null;
-      let decodeSpace = "roi"; // "roi" or "full"
-
+      let resultData;
       try {
-        const roiImageData = roiCtx.getImageData(0, 0, rw, rh);
-        qrResult = jsQR(roiImageData.data, rw, rh, {
-          inversionAttempts: "attemptBoth",
-        });
-        console.log("jsQR ROI result:", qrResult);
+        resultData = await res.json();
       } catch (e) {
-        console.error("jsQR ROI decode error:", e);
+        // In case API returns non-JSON
+        const text = await res.text();
+        resultData = { raw: text };
       }
 
-      // Fallback: if ROI fails, try full frame
-      if (!qrResult) {
-        try {
-          const fullImageData = frameCtx.getImageData(0, 0, vw, vh);
-          qrResult = jsQR(fullImageData.data, vw, vh, {
-            inversionAttempts: "attemptBoth",
-          });
-          decodeSpace = "full";
-          console.log("jsQR FULL result:", qrResult);
-        } catch (e) {
-          console.error("jsQR FULL decode error:", e);
-        }
-      }
+      setApiResult(resultData);
 
-      if (!qrResult) {
-        throw new Error("No QR detected in the box or full frame");
-      }
-
-      const text = qrResult.data;
-      setResult(text || "");
-
-      // 5) Tight QR bbox from jsQR corners
-      const loc = qrResult.location;
-      const corners = [
-        loc.topLeftCorner,
-        loc.topRightCorner,
-        loc.bottomRightCorner,
-        loc.bottomLeftCorner,
-      ];
-
-      console.log("Result Points (jsQR corners):", corners);
-
-      let x, y, w, h;
-      let sourceCanvas;
-      let sourceWidth;
-      let sourceHeight;
-
-      if (decodeSpace === "roi") {
-        sourceCanvas = roiCanvas;
-        sourceWidth = rw;
-        sourceHeight = rh;
-      } else {
-        sourceCanvas = frameCanvas;
-        sourceWidth = vw;
-        sourceHeight = vh;
-      }
-
-      if (corners && corners.length >= 3) {
-        const xs = corners.map((p) => p.x);
-        const ys = corners.map((p) => p.y);
-        const minX = Math.min(...xs);
-        const maxX = Math.max(...xs);
-        const minY = Math.min(...ys);
-        const maxY = Math.max(...ys);
-        const boxW = maxX - minX;
-        const boxH = maxY - minY;
-        const pad = PADDING_RATIO * Math.max(boxW, boxH);
-
-        x = clamp(Math.floor(minX - pad), 0, sourceWidth - 1);
-        y = clamp(Math.floor(minY - pad), 0, sourceHeight - 1);
-        w = clamp(Math.floor(boxW + pad * 2), 1, sourceWidth - x);
-        h = clamp(Math.floor(boxH + pad * 2), 1, sourceHeight - y);
-      } else {
-        // Fallback: center square inside decode space
-        const size = Math.floor(Math.min(sourceWidth, sourceHeight) * 0.5);
-        x = Math.floor((sourceWidth - size) / 2);
-        y = Math.floor((sourceHeight - size) / 2);
-        w = h = size;
-      }
-
-      console.log(
-        `QR bbox (space=${decodeSpace}) (x, y, w, h):`,
-        x,
-        y,
-        w,
-        h
-      ); // Debugging
-
-      // 6) Tight QR-only crop from whichever space we decoded in
-      const qrCanvas = document.createElement("canvas");
-      qrCanvas.width = w;
-      qrCanvas.height = h;
-      const qrCtx = qrCanvas.getContext("2d");
-      qrCtx.drawImage(sourceCanvas, x, y, w, h, 0, 0, w, h);
-
-      // 7) CDP region = center 40% of QR crop (on QR canvas)
-      const baseSize = Math.min(w, h);
-      const patchSize = Math.floor(baseSize * CENTER_FRACTION);
-      const cx = Math.floor(w / 2);
-      const cy = Math.floor(h / 2);
-
-      let px = cx - Math.floor(patchSize / 2);
-      let py = cy - Math.floor(patchSize / 2);
-      if (px < 0) px = 0;
-      if (py < 0) py = 0;
-      if (px + patchSize > w) px = w - patchSize;
-      if (py + patchSize > h) py = h - patchSize;
-
-      console.log("CDP crop (px, py, patchSize):", px, py, patchSize); // Debug
-
-      const cdpCanvas = document.createElement("canvas");
-      cdpCanvas.width = patchSize;
-      cdpCanvas.height = patchSize;
-      const cdpCtx = cdpCanvas.getContext("2d");
-      cdpCtx.drawImage(
-        qrCanvas,
-        px,
-        py,
-        patchSize,
-        patchSize,
-        0,
-        0,
-        patchSize,
-        patchSize
-      );
-
-      setQrBase(qrCanvas.toDataURL());
-      setCenterBase(cdpCanvas.toDataURL());
-
-      // ✅ Stop camera feed (user now sees only results)
+      // Optional: stop camera after capture
       stopCamera();
     } catch (err) {
       console.error(err);
-      alert("Couldn't capture or decode the QR code. Try again.");
+      alert("Couldn't capture or send the image. Try again.");
     } finally {
       setCapturing(false);
     }
@@ -312,24 +182,42 @@ function App() {
 
   return (
     <div className="container">
-      <video ref={videoRef} width="100%" autoPlay muted />
-      <button onClick={handleCaptureBox} disabled={capturing}>
-        {capturing ? "Processing..." : "Capture QR Code"}
-      </button>
+      <div style={{ position: "relative" }}>
+        <video ref={videoRef} width="100%" autoPlay muted />
+      </div>
 
-      {result && <div className="result">QR Code: {result}</div>}
+      <div style={{ marginTop: "1rem" }}>
+        <button onClick={handleCapture} disabled={capturing || !cameraReady}>
+          {capturing ? "Processing..." : "Capture & Send"}
+        </button>
 
-      {qrBase && (
-        <div className="cropped-qr">
-          <h3>QR Crop:</h3>
-          <img src={qrBase} alt="QR Region" />
+        {torchSupported && cameraReady && (
+          <button
+            onClick={handleToggleTorch}
+            style={{ marginLeft: "0.5rem" }}
+          >
+            {torchOn ? "Torch Off" : "Torch On"}
+          </button>
+        )}
+      </div>
+
+      {capturedImageDataUrl && (
+        <div style={{ marginTop: "1rem" }}>
+          <h3>Captured Image:</h3>
+          <img
+            src={capturedImageDataUrl}
+            alt="Captured frame"
+            style={{ maxWidth: "100%" }}
+          />
         </div>
       )}
 
-      {centerBase && (
-        <div className="center-patch">
-          <h3>Center Patch (CDP):</h3>
-          <img src={centerBase} alt="CDP Region" />
+      {apiResult && (
+        <div style={{ marginTop: "1rem" }}>
+          <h3>API Result:</h3>
+          <pre style={{ whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
+            {JSON.stringify(apiResult, null, 2)}
+          </pre>
         </div>
       )}
     </div>
